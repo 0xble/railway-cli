@@ -47,6 +47,9 @@ Accepted upstream baseline: `17c8e2d` (5.52.0); publish only to `fork`.
   ACCOUNT_INVALID. The parsed --json flag controls output, not child argv.
 - Existing Linux/macOS/Windows hosted matrix explicitly runs portable account
   and store regressions. A missing/billing-blocked run is never called passing.
+- Windows MSVC/GNU binaries reserve an 8 MiB main stack for the async dispatcher;
+  the debug executable otherwise overflows before even parsing `--help`.
+  Portable subprocess tests exercise the actual debug binary without skipping.
 - Tests: config lock/contention/redaction unit tests; config_store subprocess
   tests; actual loopback MCP no-Authorization regression; fork updater unit and
   package-manager subprocess refusal tests.
