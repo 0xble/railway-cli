@@ -66,6 +66,23 @@ fn json_account_errors_are_single_objects_before_side_effects() {
     assert!(!home.path().join(".railway/accounts/absent.json").exists());
 }
 #[test]
+fn help_and_version_remain_available_with_multiple_profiles() {
+    let home = tempfile::tempdir().unwrap();
+    profile(home.path(), "lpg");
+    profile(home.path(), "brianle");
+    for args in [&["whoami", "--help"][..], &["--help"], &["--version"]] {
+        let out = run(home.path(), args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stderr.is_empty());
+        assert!(!out.stdout.is_empty());
+    }
+}
+
+#[test]
 fn named_paths_are_isolated_and_list_order_is_alphabetical() {
     let home = tempfile::tempdir().unwrap();
     profile(home.path(), "lpg");

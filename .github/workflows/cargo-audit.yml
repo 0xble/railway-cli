@@ -5,17 +5,24 @@ on:
     paths:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      - ".github/workflows/cargo-audit.yml"
   schedule:
     - cron: "0 0 * * *"
+
+permissions:
+  contents: read
 
 jobs:
   security_audit:
     runs-on: ubuntu-latest
     steps:
       - name: checkout
-        uses: actions/checkout@v3.3.0
+        uses: actions/checkout@v4
 
-      - name: cargo audit
-        uses: actions-rs/audit-check@v1.2.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      # Audit the checked-in lockfile, without the legacy action's regeneration
+      # or check/issue API writes (which fail on read-only fork tokens).
+      - name: Audit locked dependencies
+        run: cargo audit --file Cargo.lock
