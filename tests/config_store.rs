@@ -1,4 +1,7 @@
 //! Credential-store corruption is handled at the public CLI boundary.
+// Windows release binaries ignore HOME and have no test-home override; keep
+// these fixtures away from a developer's actual known-folder credential store.
+#![cfg(any(unix, debug_assertions))]
 
 use std::{fs, path::Path, process::Command};
 

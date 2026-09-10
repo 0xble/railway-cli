@@ -1,4 +1,8 @@
 //! Platform-neutral public CLI contract; only synthetic credentials and isolated homes.
+// Windows release binaries deliberately have no test-home override. Never run
+// mutating subprocess fixtures against the actual Windows known-folder home.
+#![cfg(any(unix, debug_assertions))]
+
 use serde_json::{Value, json};
 use std::{
     fs,

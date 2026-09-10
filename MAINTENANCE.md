@@ -53,6 +53,8 @@ Accepted upstream baseline: `17c8e2d` (5.52.0); publish only to `fork`.
 - Debug-only `RAILWAY_TEST_HOME` isolates subprocess credential fixtures on
   Windows, whose known-folder API ignores HOME/USERPROFILE. It must be absolute
   and is compiled out of release builds; release credential routing is unchanged.
+  The mutating Windows subprocess fixtures run only in debug mode; release-mode
+  tests must never fall back to a developer's real known-folder credentials.
 - Tests: config lock/contention/redaction unit tests; config_store subprocess
   tests; actual loopback MCP no-Authorization regression; fork updater unit and
   package-manager subprocess refusal tests.
