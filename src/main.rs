@@ -40,6 +40,7 @@ mod telemetry;
 // Generates the commands based on the modules in the commands directory
 // Specify the modules you want to include in the commands_enum! macro
 commands!(
+    account,
     add,
     agent,
     api,
@@ -246,6 +247,15 @@ async fn main() -> Result<()> {
     let raw_os_args: Vec<OsString> = std::env::args_os().collect();
     let normalized_os_args = scale::normalize_legacy_scale_args(raw_os_args.clone());
     let args = build_args().try_get_matches_from(normalized_os_args);
+    // Account routing is intentionally before update checks, telemetry, token
+    // refresh, or command dispatch. A missing selector with multiple accounts
+    // must not make any provider/network side effect.
+    if let Ok(cli) = args.as_ref() {
+        if let Err(error) = prepare_account_selection(cli) {
+            eprintln!("{error:#}");
+            std::process::exit(2);
+        }
+    }
     let is_tty = std::io::stdout().is_terminal();
     // Help, version, and parse-error paths are read-only: no staged-binary
     // apply, no background update spawn, no extra latency.
@@ -474,6 +484,57 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn prepare_account_selection(cli: &clap::ArgMatches) -> Result<()> {
+    Configs::set_account_selection(None);
+    if !command_is_account_scoped(cli) {
+        return Ok(());
+    }
+    let requested = cli.get_one::<String>("account").map(String::as_str);
+    // A named login is the only command allowed to create a profile. A bare
+    // first login remains the legacy bootstrap path; it is never auto-adopted
+    // after named accounts exist.
+    let allow_new = cli.subcommand_name() == Some("login") && requested.is_some();
+    let resolved = Configs::resolve_account(requested, allow_new)?;
+    if resolved.is_none() && cli.subcommand_name() != Some("login") {
+        anyhow::bail!(
+            "No named Railway account is configured. Run `railway login --account <NAME>` or `railway account import-legacy <NAME>`."
+        );
+    }
+    Configs::set_account_selection(resolved);
+    Ok(())
+}
+
+fn command_is_account_scoped(cli: &clap::ArgMatches) -> bool {
+    const UNSCOPED: &[&str] = &[
+        "account",
+        "completion",
+        "docs",
+        "setup",
+        "skills",
+        "upgrade",
+        "autoupdate",
+        "telemetry_cmd",
+        "check_updates",
+    ];
+    let Some(command) = cli.subcommand_name() else {
+        return false;
+    };
+    if UNSCOPED.contains(&command) || is_code_get_config(cli) {
+        return false;
+    }
+    if command == "mcp"
+        && matches!(cli.subcommand(), Some((_, args)) if args.subcommand_name() == Some("install"))
+    {
+        return false;
+    }
+    if command == "templates"
+        && matches!(cli.subcommand(), Some((_, args)) if matches!(args.subcommand_name(), Some("search" | "find" | "list" | "ls")))
+    {
+        return false;
+    }
+    true
 }
 
 fn is_code_get_config(cli: &clap::ArgMatches) -> bool {

@@ -271,6 +271,18 @@ OpenCode process on a running agent and removes the shared SSH block and the
 Desktop connection/project saved by setup. It does not wake a sleeping agent.
 The agent remains; `railway ca sleep my-box` stops its compute bill.
 
+## Named accounts
+
+```sh
+railway login --account work
+railway login --account personal
+railway --account work status
+railway account list
+railway account import-legacy legacy
+```
+
+Named credentials and project links are isolated in `~/.railway/accounts`. With one named account it is selected automatically; with two or more, every account-scoped command must include `--account NAME` and fails before refresh, telemetry, update checks, or provider/network activity. Help, version, completion, setup, and account listing are unscoped. The legacy `~/.railway/config.json` is preserved; importing copies it explicitly. Named accounts never fall back to process-wide `RAILWAY_TOKEN` or `RAILWAY_API_TOKEN`.
+
 ## Contributing
 
 See [CONTRIBUTING.md](https://github.com/railwayapp/cli/blob/master/CONTRIBUTING.md) for information on setting up this repository locally.
