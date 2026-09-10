@@ -145,21 +145,50 @@ impl Configs {
             .expect("account selection lock poisoned") = account;
     }
 
+    pub fn selected_account() -> Option<String> {
+        account_selection()
+            .lock()
+            .expect("account selection lock poisoned")
+            .clone()
+    }
+
+    /// Account-specific ancillary secrets; legacy locations remain unchanged.
+    pub fn account_data_dir_in(home: &Path) -> PathBuf {
+        match Self::selected_account() {
+            Some(name) => home.join(Self::accounts_relative_dir()).join(name),
+            None => home.join(".railway"),
+        }
+    }
+
+    fn accounts_relative_dir() -> &'static str {
+        match Self::get_environment_id() {
+            Environment::Production => ".railway/accounts",
+            Environment::Staging => ".railway/accounts-staging",
+            Environment::Dev => ".railway/accounts-dev",
+        }
+    }
+
     pub fn account_names() -> Result<Vec<String>> {
         let dir = Self::accounts_dir()?;
         let mut names = Vec::new();
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path
-                    .extension()
-                    .is_some_and(|extension| extension == "json")
-                    && let Some(name) = path.file_stem().and_then(|name| name.to_str())
-                    && Self::valid_account_name(name)
-                {
-                    names.push(name.to_owned());
+        match fs::read_dir(dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if entry.file_type()?.is_file()
+                        && path
+                            .extension()
+                            .is_some_and(|extension| extension == "json")
+                        && let Some(name) = path.file_stem().and_then(|name| name.to_str())
+                        && Self::valid_account_name(name)
+                    {
+                        names.push(name.to_owned());
+                    }
                 }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Unable to enumerate named accounts"),
         }
         names.sort();
         Ok(names)
@@ -200,6 +229,7 @@ impl Configs {
 
     fn valid_account_name(name: &str) -> bool {
         !name.is_empty()
+            && !matches!(name, "." | "..")
             && name.len() <= 64
             && name
                 .bytes()
@@ -209,7 +239,7 @@ impl Configs {
     fn accounts_dir() -> Result<PathBuf> {
         Ok(dirs::home_dir()
             .context("Unable to get home directory")?
-            .join(".railway/accounts"))
+            .join(Self::accounts_relative_dir()))
     }
 
     pub fn new() -> Result<Self> {
@@ -1002,34 +1032,12 @@ impl Configs {
         // umask — the common 022 would leave it world-readable.
         secure_config_dir(config_dir)?;
 
-        // Use a temporary file to achieve an atomic write. The name is unique per
-        // writer — matching `util::write_atomic`'s pid+nanos convention — because
-        // a shared `config.tmp` opened with truncate lets two concurrent writers
-        // interleave into one file and produce malformed JSON, which the loader
-        // then "repairs" by discarding every token. Threads matter as much as
-        // processes here: the MCP server serves tool calls concurrently.
-        let pid = std::process::id();
-        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
-        let tmp_file_path = self
-            .root_config_path
-            .with_extension(format!("tmp.{pid}-{nanos}"));
-        let mut options = File::options();
-        options.create(true).write(true).truncate(true);
-        // Set the mode at creation so the tokens are never briefly readable.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let tmp_file = options.open(&tmp_file_path)?;
-        // An existing tmp file keeps its old mode, so enforce it either way.
-        secure_config_file(&tmp_file_path)?;
-        serde_json::to_writer_pretty(&tmp_file, value)?;
-        tmp_file.sync_all()?;
-
-        // Rename to the final destination. `rename_replacing` is atomic on both
-        // Unix and Windows.
-        crate::util::rename_replacing(tmp_file_path.as_path(), &self.root_config_path)?;
+        // Random exclusive temporary file is private from creation, and cleaned
+        // on failure. Never follow/truncate a predictable stale temp symlink.
+        let mut tmp = tempfile::NamedTempFile::new_in(config_dir)?;
+        serde_json::to_writer_pretty(tmp.as_file_mut(), value)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&self.root_config_path)?;
 
         Ok(())
     }

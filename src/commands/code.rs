@@ -1245,7 +1245,7 @@ fn claude_token_cache_path() -> Option<std::path::PathBuf> {
 /// cached setup-token every run, sending their next `--claude` launch through a
 /// browser mint.
 fn claude_token_cache_path_in(home: &Path) -> std::path::PathBuf {
-    home.join(".railway").join("claude-code-token")
+    Configs::account_data_dir_in(home).join("claude-code-token")
 }
 
 /// Read the cached token, if one is there and still plausible.

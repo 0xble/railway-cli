@@ -134,7 +134,7 @@ pub struct SkillsPrefs {
 
 impl AgentPrefs {
     pub fn path_in(home: &Path) -> PathBuf {
-        home.join(".railway").join("agent-prefs.json")
+        crate::config::Configs::account_data_dir_in(home).join("agent-prefs.json")
     }
 
     /// Reads the prefs, treating missing OR unparseable as "not configured".

@@ -144,7 +144,7 @@ impl SavedConfig {
 
     fn save_in(&self, home: &Path) -> Result<()> {
         let contents = serde_json::to_vec_pretty(self)?;
-        let directory = home.join(".railway");
+        let directory = Configs::account_data_dir_in(home);
         fs::create_dir_all(&directory)?;
         secure_config_dir(&directory)?;
         // NamedTempFile starts at 0600 on Unix; no credentials are ever
@@ -159,7 +159,7 @@ impl SavedConfig {
     }
 
     fn load_in(home: &Path) -> Result<Self> {
-        let path = home.join(".railway").join(FILE);
+        let path = Configs::account_data_dir_in(home).join(FILE);
         let contents = match fs::read(&path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
@@ -261,7 +261,7 @@ pub(super) fn command(args: Args) -> Result<()> {
 }
 
 pub(super) fn clear_in(home: &Path) {
-    let _ = fs::remove_file(home.join(".railway").join(FILE));
+    let _ = fs::remove_file(Configs::account_data_dir_in(home).join(FILE));
 }
 
 #[cfg(test)]
