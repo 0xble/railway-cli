@@ -94,6 +94,7 @@ macro_rules! commands {
                             let start = ::std::time::Instant::now();
                             let result = $crate::commands::$module::command(args).await;
                             let duration = start.elapsed();
+                            if command_name != "account" {
                             $crate::telemetry::send($crate::telemetry::CliTrackEvent {
                                 command: command_name.to_string(),
                                 sub_command: subcommand_name,
@@ -108,6 +109,7 @@ macro_rules! commands {
                                 arch: ::std::env::consts::ARCH,
                                 is_ci: $crate::config::Configs::env_is_ci(),
                             }).await;
+                            }
                             result?;
                         },
                     )*

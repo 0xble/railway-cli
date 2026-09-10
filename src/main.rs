@@ -272,7 +272,11 @@ async fn main() -> Result<()> {
         .skip(1)
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    let raw_subcommand = raw_args.iter().find(|a| !a.starts_with('-')).cloned();
+    let raw_subcommand = args
+        .as_ref()
+        .ok()
+        .and_then(|cli| cli.subcommand_name().map(str::to_owned))
+        .or_else(|| raw_args.iter().find(|a| !a.starts_with('-')).cloned());
 
     let is_update_management_cmd = matches!(
         raw_subcommand.as_deref(),
@@ -283,7 +287,9 @@ async fn main() -> Result<()> {
     let is_read_only_invocation = is_help_or_error
         || raw_subcommand.is_none()
         || matches!(raw_subcommand.as_deref(), Some("help"))
-        || args.as_ref().is_ok_and(is_code_get_config);
+        || args
+            .as_ref()
+            .is_ok_and(|cli| is_code_get_config(cli) || cli.subcommand_name() == Some("account"));
     let auto_update_enabled = !telemetry::is_auto_update_disabled();
     let machine_output = raw_args.iter().any(|arg| arg == "--json");
     let embedded_setup = std::env::var("RAILWAY_SETUP_EMBEDDED").is_ok();
@@ -488,16 +494,20 @@ async fn main() -> Result<()> {
 
 fn prepare_account_selection(cli: &clap::ArgMatches) -> Result<()> {
     Configs::set_account_selection(None);
-    if !command_is_account_scoped(cli) {
+    let requested = cli.get_one::<String>("account").map(String::as_str);
+    if !command_is_account_scoped(cli) && requested.is_none() {
         return Ok(());
     }
-    let requested = cli.get_one::<String>("account").map(String::as_str);
     // A named login is the only command allowed to create a profile. A bare
     // first login remains the legacy bootstrap path; it is never auto-adopted
     // after named accounts exist.
     let allow_new = cli.subcommand_name() == Some("login") && requested.is_some();
     let resolved = Configs::resolve_account(requested, allow_new)?;
-    if resolved.is_none() && cli.subcommand_name() != Some("login") {
+    if resolved.is_none()
+        && !matches!(cli.subcommand_name(), Some("login" | "setup" | "mcp"))
+        && !is_code_get_config(cli)
+        && !Configs::new()?.has_auth_credentials()
+    {
         anyhow::bail!(
             "No named Railway account is configured. Run `railway login --account <NAME>` or `railway account import-legacy <NAME>`."
         );
@@ -511,7 +521,6 @@ fn command_is_account_scoped(cli: &clap::ArgMatches) -> bool {
         "account",
         "completion",
         "docs",
-        "setup",
         "skills",
         "upgrade",
         "autoupdate",
@@ -521,12 +530,7 @@ fn command_is_account_scoped(cli: &clap::ArgMatches) -> bool {
     let Some(command) = cli.subcommand_name() else {
         return false;
     };
-    if UNSCOPED.contains(&command) || is_code_get_config(cli) {
-        return false;
-    }
-    if command == "mcp"
-        && matches!(cli.subcommand(), Some((_, args)) if args.subcommand_name() == Some("install"))
-    {
+    if UNSCOPED.contains(&command) {
         return false;
     }
     if command == "templates"
@@ -544,6 +548,7 @@ fn is_code_get_config(cli: &clap::ArgMatches) -> bool {
 fn command_needs_refresh(cli: &clap::ArgMatches) -> bool {
     // Commands that do not require authentication -- skip token refresh for these.
     const NO_AUTH_COMMANDS: &[&str] = &[
+        "account",
         "login",
         "logout",
         "completion",

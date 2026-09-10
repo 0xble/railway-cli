@@ -60,17 +60,26 @@ impl McpTransport {
 }
 
 /// The argv written into harness configs for the stdio transports.
-fn stdio_args(transport: McpTransport) -> Vec<&'static str> {
-    match transport {
-        McpTransport::Local => vec!["mcp", "local"],
-        // A bare `mcp` — the canonical invocation now that it starts the
-        // proxy. `mcp proxy` still works and still classifies as remote, so
-        // configs written before the cutover keep running; new ones just say
-        // it the short way.
-        McpTransport::RemoteProxy => vec!["mcp"],
-        // RemoteOauth entries are URL-based; callers never ask for its argv.
-        McpTransport::RemoteOauth => unreachable!("RemoteOauth has no stdio argv"),
+fn stdio_args(transport: McpTransport) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(name) = Configs::selected_account() {
+        args.extend(["--account".to_owned(), name]);
     }
+    args.extend(
+        match transport {
+            McpTransport::Local => vec!["mcp", "local"],
+            // A bare `mcp` — the canonical invocation now that it starts the
+            // proxy. `mcp proxy` still works and still classifies as remote, so
+            // configs written before the cutover keep running; new ones just say
+            // it the short way.
+            McpTransport::RemoteProxy => vec!["mcp"],
+            // RemoteOauth entries are URL-based; callers never ask for its argv.
+            McpTransport::RemoteOauth => unreachable!("RemoteOauth has no stdio argv"),
+        }
+        .into_iter()
+        .map(str::to_owned),
+    );
+    args
 }
 
 pub async fn command(args: Args) -> Result<()> {
@@ -264,6 +273,25 @@ fn stdio_argv_matches<'a>(
     args: impl Iterator<Item = &'a str> + Clone,
     transport: McpTransport,
 ) -> bool {
+    let args: Vec<_> = args.collect();
+    let mut command_args = Vec::new();
+    let mut selected = None;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--account" {
+            selected = iter.next().map(str::to_owned);
+        } else if let Some(name) = arg.strip_prefix("--account=") {
+            selected = Some(name.to_owned());
+        } else {
+            command_args.push(arg);
+        }
+    }
+    if let Some(expected) = Configs::selected_account() {
+        if selected.as_deref() != Some(expected.as_str()) {
+            return false;
+        }
+    }
+    let args = command_args.into_iter();
     if !args.clone().any(|a| a == "mcp") {
         return false;
     }
@@ -426,7 +454,7 @@ fn write_opencode_mcp(path: &Path, transport: McpTransport) -> Result<()> {
             "enabled": true,
         }),
         stdio => {
-            let mut command = vec!["railway"];
+            let mut command = vec!["railway".to_owned()];
             command.extend(stdio_args(stdio));
             json!({
                 "type": "local",

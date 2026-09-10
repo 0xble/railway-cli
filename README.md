@@ -281,7 +281,11 @@ railway account list
 railway account import-legacy legacy
 ```
 
-Named credentials and project links are isolated in `~/.railway/accounts`. With one named account it is selected automatically; with two or more, every account-scoped command must include `--account NAME` and fails before refresh, telemetry, update checks, or provider/network activity. Help, version, completion, setup, and account listing are unscoped. The legacy `~/.railway/config.json` is preserved; importing copies it explicitly. Named accounts never fall back to process-wide `RAILWAY_TOKEN` or `RAILWAY_API_TOKEN`.
+Named credentials and project links are isolated in `~/.railway/accounts`. With one named account it is selected automatically; with two or more, account-scoped commands require `--account NAME` before refresh, telemetry, updates, or provider activity. This includes setup, MCP installation, and replay of saved connection credentials. Help, version, completion, and account listing need no selector; an explicit selector is always validated. With zero named accounts, existing legacy-file and environment-token authentication continue to work; without credentials the CLI gives login guidance.
+
+`railway account list --json` reports local names, user IDs, credential-presence/type, expiry, and linked-project counts without printing tokens or contacting Railway. Credential presence is not remote validity. `railway logout --account NAME` clears only that profile and its ancillary secret caches; the profile remains listed as logged out. `account import-legacy NAME` validates and atomically copies the legacy file with owner-only permissions, never overwriting an existing profile or changing the source. Staging/dev profiles use separate `accounts-staging`/`accounts-dev` directories.
+
+Named accounts never fall back to ambient `RAILWAY_TOKEN` or `RAILWAY_API_TOKEN`. MCP stdio installation pins the selected account in its child argv. Editor-managed `mcp install --oauth` authenticates independently with the editor's own OAuth identity, not the selected CLI account. Existing MCP entries should be reinstalled with `--account NAME` before adding a second profile. Account selection does not isolate unrelated third-party editor sign-ins or OS SSH keys.
 
 ## Contributing
 

@@ -21,6 +21,14 @@ Maintained fork: `0xble/railway-cli` of `railwayapp/cli`; branch
 - **Surfaces:** `src/config.rs`, `src/main.rs`, `src/commands/account.rs`.
 - **Upstream issue:** https://github.com/railwayapp/cli/issues/688
 - **Regression:** `cargo test`, `cargo check`, and isolated-HOME CLI tests.
+- **Review repair:** legacy auth remains usable with zero profiles; setup/MCP and
+  saved credentials obey selectors; MCP children pin argv; account import is
+  private atomic no-clobber; account listing is local metadata without telemetry.
+- **Durable tests:** `tests/multiaccount.rs`, `tests/multiaccount_auth.rs` exercise
+  subprocess routing, actual loopback HTTP auth, import, modes, and cache isolation.
+- **Ancillary state:** account-scoped saved connections, Claude cache, and agent
+  preferences; no automatic migration of legacy ancillary files. OS SSH keys
+  and third-party editor credentials remain outside the Railway account store.
 - **Rollback:** revert this patch commit.
 - **Retire when:** upstream ships equivalent isolated named profiles.
 
