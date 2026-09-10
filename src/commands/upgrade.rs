@@ -43,6 +43,10 @@ fn fail_if_non_interactive_requested(yes: bool, message: &str) -> Result<()> {
     Ok(())
 }
 
+fn ensure_upstream_replacement_allowed() -> Result<()> {
+    crate::util::self_update::reject_upstream_self_update()
+}
+
 fn retry_command(rollback: bool, yes: bool, elevated: bool) -> String {
     let mut parts = Vec::new();
 
@@ -65,6 +69,8 @@ fn retry_command(rollback: bool, yes: bool, elevated: bool) -> String {
 }
 
 fn run_upgrade_command(method: InstallMethod) -> Result<String> {
+    ensure_upstream_replacement_allowed()?;
+
     // Capture before replacement; current_exe() can point at a deleted inode
     // after a package manager swaps the running executable on Linux.
     let executable = std::env::current_exe().context("Failed to locate the CLI binary")?;
@@ -254,8 +260,21 @@ pub async fn command(args: Args) -> Result<()> {
         if let Some(cmd) = method.upgrade_command() {
             println!("{} {}", "Upgrade command:".bold(), cmd);
         }
+        if let Some(provenance) = crate::util::self_update::fork_provenance() {
+            println!("{} {}", "Build provenance:".bold(), provenance);
+            println!(
+                "{} {}",
+                "Source commit:".bold(),
+                option_env!("RAILWAY_SOURCE_COMMIT").unwrap_or("unavailable")
+            );
+        }
+        if !crate::util::self_update::upstream_self_updates_allowed() {
+            println!("{} blocked", "Upstream self-updates:".bold());
+        }
         return Ok(());
     }
+
+    ensure_upstream_replacement_allowed()?;
 
     if args.rollback {
         if !method.can_self_update() {
@@ -402,7 +421,9 @@ pub async fn command(args: Args) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, installed_version, validate_interaction};
+    use super::{
+        Args, ensure_upstream_replacement_allowed, installed_version, validate_interaction,
+    };
     use clap::Parser;
 
     #[test]
@@ -428,6 +449,16 @@ mod tests {
     fn non_interactive_upgrade_requires_yes() {
         assert!(validate_interaction(false, false).is_err());
         assert!(validate_interaction(true, false).is_ok());
+    }
+
+    #[test]
+    fn fork_build_rejects_manual_upgrades() {
+        let error = ensure_upstream_replacement_allowed()
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("upstream self-update"));
+        assert!(error.contains("0xble/railway-cli"));
     }
 
     #[test]

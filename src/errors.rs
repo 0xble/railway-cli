@@ -27,6 +27,16 @@ fn ratelimit_message(retry_after_secs: Option<u64>) -> String {
 
 #[derive(Error, Debug)]
 pub enum RailwayError {
+    #[error(
+        "Multiple Railway accounts are configured. Re-run with `--account <NAME>`; see `railway account list`."
+    )]
+    AccountRequired,
+    #[error(
+        "Unknown account {0:?}. Run `railway account list` or `railway login --account <NAME>`."
+    )]
+    AccountUnknown(String),
+    #[error("Invalid account name {0:?}. Use letters, numbers, '.', '_' or '-'.")]
+    AccountInvalid(String),
     #[error("Unauthorized. Please login with `railway login`")]
     Unauthorized,
 
@@ -168,6 +178,9 @@ impl RailwayError {
     /// decision rather than silently falling into a generic bucket.
     pub fn code(&self) -> &'static str {
         match self {
+            RailwayError::AccountRequired => "ACCOUNT_REQUIRED",
+            RailwayError::AccountUnknown(_) => "ACCOUNT_UNKNOWN",
+            RailwayError::AccountInvalid(_) => "ACCOUNT_INVALID",
             RailwayError::Unauthorized
             | RailwayError::UnauthorizedToken(_)
             | RailwayError::UnauthorizedLogin => "UNAUTHORIZED",

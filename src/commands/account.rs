@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::{RailwayConfig, secure_config_dir};
+use anyhow::anyhow;
 use std::{fs, io::Write};
 
 /// Inspect named Railway accounts or explicitly import the legacy login.
@@ -26,8 +27,8 @@ pub async fn command(args: Args) -> Result<()> {
             for name in Configs::account_names()? {
                 let path = Configs::account_config_path(&name)?;
                 let config: RailwayConfig = serde_json::from_slice(&fs::read(&path)?)
-                    .with_context(|| {
-                        format!("Unable to read account {name:?}; file left unchanged")
+                    .map_err(|_| {
+                        anyhow!("Unable to read account {name:?}; invalid credential store, file left unchanged. Restore a known-good backup.")
                     })?;
                 let user = config.user;
                 let authenticated = user
@@ -72,7 +73,7 @@ pub async fn command(args: Args) -> Result<()> {
                 "No readable legacy login. Run `railway login --account <NAME>` instead.",
             )?;
             let config: RailwayConfig = serde_json::from_slice(&bytes)
-                .context("Legacy config is invalid; refusing to import it")?;
+                .map_err(|_| anyhow!("Legacy config is invalid; refusing to import it"))?;
             if !config
                 .user
                 .access_token

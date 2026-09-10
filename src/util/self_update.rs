@@ -7,6 +7,32 @@ use colored::Colorize;
 /// Maximum age for a staged update before it's considered stale and cleaned up.
 const STAGED_UPDATE_MAX_AGE_DAYS: i64 = 7;
 
+/// The maintained-fork identity embedded at build time, if the manifest opted
+/// into fork policy. Upstream builds deliberately have no provenance value.
+pub fn fork_provenance() -> Option<&'static str> {
+    option_env!("RAILWAY_FORK_PROVENANCE")
+}
+
+/// Whether this executable may replace itself with an upstream Railway
+/// release. This is compile-time policy, not an environment-variable switch.
+pub fn upstream_self_updates_allowed() -> bool {
+    !cfg!(railway_upstream_self_update_blocked)
+}
+
+/// Refuse every path that would replace a protected fork with an upstream
+/// release: explicit upgrade, background staging/application, package-manager
+/// replacement, and rollback from a potentially upstream backup.
+pub fn reject_upstream_self_update() -> Result<()> {
+    if upstream_self_updates_allowed() {
+        return Ok(());
+    }
+
+    let provenance = fork_provenance().unwrap_or("an unidentified fork");
+    bail!(
+        "This {provenance} build blocks upstream self-update replacement. Update it from its fork source instead."
+    );
+}
+
 fn railway_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Failed to get home directory")?;
     Ok(home.join(".railway"))
@@ -277,6 +303,11 @@ async fn download_and_stage_inner(version: &str, timeout_secs: u64) -> Result<()
 pub async fn download_and_stage(version: &str) -> Result<bool> {
     use fs2::FileExt;
 
+    if !upstream_self_updates_allowed() {
+        let _ = StagedUpdate::clean();
+        return Ok(false);
+    }
+
     let target = detect_target_triple()?;
 
     if let Ok(Some(staged)) = StagedUpdate::read() {
@@ -321,6 +352,8 @@ pub async fn download_and_stage(version: &str) -> Result<bool> {
 /// The child runs independently of the parent — it survives after the
 /// parent exits, so slow downloads are not killed by the exit timeout.
 pub fn spawn_background_download(version: &str) -> Result<()> {
+    reject_upstream_self_update()?;
+
     let exe = std::env::current_exe().context("Failed to get current exe path")?;
     let log_path = auto_update_log_path()?;
 
@@ -538,6 +571,8 @@ fn replace_binary(source: &Path, target: &Path) -> Result<()> {
 /// Applies a staged update by atomically replacing the current binary.
 /// Returns Ok(version) on success.
 fn apply_staged_update() -> Result<String> {
+    reject_upstream_self_update()?;
+
     let staged = StagedUpdate::read()?.context("No staged update found")?;
 
     // Verify the staged binary matches the current platform.
@@ -618,6 +653,11 @@ fn validate_staged() -> Result<StagedUpdate> {
 pub fn try_apply_staged() -> Option<String> {
     use fs2::FileExt;
 
+    if !upstream_self_updates_allowed() {
+        let _ = StagedUpdate::clean();
+        return None;
+    }
+
     let lock_path = match update_lock_path() {
         Ok(p) => p,
         Err(_) => return None,
@@ -663,6 +703,8 @@ pub fn try_apply_staged() -> Option<String> {
 }
 
 pub async fn self_update_interactive() -> Result<String> {
+    reject_upstream_self_update()?;
+
     use super::progress::UpdateStep;
     let checking = UpdateStep::start("Checking for updates");
     // Try the network check first.  If it fails and an update is already
@@ -765,6 +807,8 @@ fn choose_rollback_candidate(
 }
 
 pub fn rollback(non_interactive: bool) -> Result<()> {
+    reject_upstream_self_update()?;
+
     // Acquire the update lock first so background auto-update processes cannot
     // stage or apply while we are building the candidate list or prompting.
     let lock_path = update_lock_path()?;
@@ -850,6 +894,20 @@ pub fn rollback(non_interactive: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fork_build_blocks_upstream_self_replacement() {
+        assert!(!upstream_self_updates_allowed());
+        assert_eq!(fork_provenance(), Some("0xble/railway-cli"));
+    }
+
+    #[test]
+    fn blocked_update_message_names_the_fork() {
+        let error = reject_upstream_self_update().unwrap_err().to_string();
+
+        assert!(error.contains("0xble/railway-cli"));
+        assert!(error.contains("upstream self-update"));
+    }
 
     #[test]
     fn prune_backups_removes_oldest() {

@@ -40,7 +40,20 @@ fn run_fixture_at(home: &Path, path: &str, manager: &str, script: &str) -> Outpu
         .env("RAILWAY_NO_AUTO_UPDATE", "1")
         .env("HTTPS_PROXY", "http://127.0.0.1:9")
         .args(["upgrade", "--yes"]);
-    command.output().unwrap()
+    let output = command.output().unwrap();
+    if cfg!(railway_upstream_self_update_blocked) {
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("blocks upstream self-update replacement")
+        );
+        assert_eq!(
+            std::fs::read(home.join(path)).unwrap(),
+            std::fs::read(env!("CARGO_BIN_EXE_railway")).unwrap()
+        );
+        assert!(!home.join(".railway/update-status.json").exists());
+    }
+    output
 }
 
 #[test]
@@ -58,6 +71,11 @@ printf '#!/bin/sh\necho railway 255.255.254\n' > "$HOME/homebrew/opt/railway/bin
         "brew",
         script,
     );
+    // In fork builds the fixture above verifies refusal and unchanged binary;
+    // retain upstream outcome assertions for the upstream channel.
+    if cfg!(railway_upstream_self_update_blocked) {
+        return;
+    }
     let text = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{text}");
     assert!(
@@ -77,6 +95,11 @@ echo 'package manager chatter'
 fn explicit_upgrade_shows_verified_cli_and_skill_outcomes_even_with_auto_updates_off() {
     let home = tempfile::tempdir().unwrap();
     let output = run_fixture(home.path(), INSTALL);
+    // In fork builds the fixture above verifies refusal and unchanged binary;
+    // retain upstream outcome assertions for the upstream channel.
+    if cfg!(railway_upstream_self_update_blocked) {
+        return;
+    }
     let text = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{text}");
     assert!(output.stdout.is_empty());
@@ -105,6 +128,11 @@ fn explicit_upgrade_shows_verified_cli_and_skill_outcomes_even_with_auto_updates
 fn package_manager_failure_keeps_diagnostics_and_never_claims_completion() {
     let home = tempfile::tempdir().unwrap();
     let output = run_fixture(home.path(), "echo 'registry unavailable' >&2\nexit 7");
+    // In fork builds the fixture above verifies refusal and unchanged binary;
+    // retain upstream outcome assertions for the upstream channel.
+    if cfg!(railway_upstream_self_update_blocked) {
+        return;
+    }
     let text = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(text.contains("registry unavailable"), "{text}");
@@ -123,6 +151,11 @@ fn cli_success_with_skill_failure_is_recorded_as_partial_success() {
         "targets": {target.to_str().unwrap(): {"use-railway": {"installed_at": "t", "files": {}}}}
     }).to_string()).unwrap();
     let output = run_fixture(home.path(), INSTALL);
+    // In fork builds the fixture above verifies refusal and unchanged binary;
+    // retain upstream outcome assertions for the upstream channel.
+    if cfg!(railway_upstream_self_update_blocked) {
+        return;
+    }
     let text = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{text}");
     assert!(text.contains("✓ CLI installed"), "{text}");
