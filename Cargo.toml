@@ -1,6 +1,6 @@
 [package]
 name = "railwayapp"
-version = "5.51.1"
+version = "5.52.0"
 edition = "2024"
 license = "MIT"
 authors = ["Railway <contact@railway.com>"]
@@ -11,6 +11,12 @@ repository = "https://github.com/railwayapp/cli"
 rust-version = "1.85.0"
 default-run = "railway"
 include = ["src/**/*", "assets/**/*", "build.rs", "LICENSE", "README.md"]
+
+# Fork policy is read by build.rs and compiled into the executable. Upstream
+# builds have no such metadata and retain upstream update behaviour.
+[package.metadata.railway.fork]
+provenance = "0xble/railway-cli"
+block_upstream_self_updates = true
 
 [[bin]]
 name = "railway"
@@ -119,6 +125,9 @@ tempfile = "3.23.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 portable-pty = "0.8"
 vt100 = "0.16"
+
+[build-dependencies]
+toml = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 pageant = "0.2.0"

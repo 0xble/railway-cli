@@ -198,21 +198,17 @@ impl Configs {
         let names = Self::account_names()?;
         if let Some(name) = requested {
             if !Self::valid_account_name(name) {
-                bail!("Invalid account name {name:?}. Use letters, numbers, '.', '_' or '-'.");
+                return Err(RailwayError::AccountInvalid(name.to_owned()).into());
             }
             if allow_new || names.iter().any(|candidate| candidate == name) {
                 return Ok(Some(name.to_owned()));
             }
-            bail!(
-                "Unknown account {name:?}. Run `railway account list` or `railway login --account {name}`."
-            );
+            return Err(RailwayError::AccountUnknown(name.to_owned()).into());
         }
         match names.len() {
             0 => Ok(None),
             1 => Ok(names.first().cloned()),
-            _ => bail!(
-                "Multiple Railway accounts are configured. Re-run with `--account <NAME>`; see `railway account list`."
-            ),
+            _ => Err(RailwayError::AccountRequired.into()),
         }
     }
 
@@ -236,41 +232,30 @@ impl Configs {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     }
 
+    fn credential_home_dir() -> Result<PathBuf> {
+        // Windows' known-folder API ignores HOME/USERPROFILE. Subprocess tests
+        // must never fall through to the developer's actual credential store.
+        // Like the mock-backboard override, this is absent from release builds.
+        #[cfg(debug_assertions)]
+        if let Some(home) = std::env::var_os("RAILWAY_TEST_HOME") {
+            let home = PathBuf::from(home);
+            anyhow::ensure!(home.is_absolute(), "RAILWAY_TEST_HOME must be absolute");
+            return Ok(home);
+        }
+        dirs::home_dir().context("Unable to get home directory")
+    }
+
     fn accounts_dir() -> Result<PathBuf> {
-        Ok(dirs::home_dir()
-            .context("Unable to get home directory")?
-            .join(Self::accounts_relative_dir()))
+        Ok(Self::credential_home_dir()?.join(Self::accounts_relative_dir()))
     }
 
     pub fn new() -> Result<Self> {
         let root_config_path = Self::root_config_path()?;
-
-        if let Ok(mut file) = File::open(&root_config_path) {
-            let mut serialized_config = vec![];
-            file.read_to_end(&mut serialized_config)?;
-
-            let root_config: RailwayConfig = serde_json::from_slice(&serialized_config)
-                .unwrap_or_else(|_| {
-                    crate::util::reporter::warn(
-                        "CONFIG_UNPARSEABLE",
-                        "Unable to parse config file, regenerating",
-                        None,
-                    );
-                    RailwayConfig::default()
-                });
-
-            let config = Self {
-                root_config,
-                root_config_path,
-                backboard_url_override: Self::backboard_url_override_from_env(),
-            };
-
-            return Ok(config);
-        }
+        let root_config = Self::read_root_config(&root_config_path)?.unwrap_or_default();
 
         Ok(Self {
             root_config_path,
-            root_config: RailwayConfig::default(),
+            root_config,
             backboard_url_override: Self::backboard_url_override_from_env(),
         })
     }
@@ -316,15 +301,25 @@ impl Configs {
             Environment::Dev => ".railway/config-dev.json",
         };
 
-        let home_dir = dirs::home_dir().context("Unable to get home directory")?;
+        let home_dir = Self::credential_home_dir()?;
         Ok(Path::new(&home_dir).join(root_config_partial_path))
+    }
+
+    /// Reload this exact account without consulting the process-global selector.
+    pub(crate) fn reloaded(&self) -> Result<Self> {
+        Ok(Self {
+            root_config_path: self.root_config_path.clone(),
+            root_config: Self::read_root_config(&self.root_config_path)?.unwrap_or_default(),
+            backboard_url_override: self.backboard_url_override.clone(),
+        })
     }
 
     /// Re-read the root config from disk, discarding any in-memory state.
     /// Used after acquiring the config lock so a refresh sees credentials
     /// freshly written by another concurrent process.
     pub fn reload(&mut self) -> Result<()> {
-        self.root_config = Self::read_root_config(&self.root_config_path).unwrap_or_default();
+        let root_config = Self::read_root_config(&self.root_config_path)?.unwrap_or_default();
+        self.root_config = root_config;
         Ok(())
     }
 
@@ -513,19 +508,44 @@ impl Configs {
     /// park a tokio worker for up to `CONFIG_LOCK_TIMEOUT` and starve unrelated
     /// tasks — the long-running MCP server serves tool calls concurrently, so
     /// that is a real stall, not a theoretical one.
-    pub(crate) async fn acquire_lock(&self) -> ConfigLock {
+    pub(crate) async fn acquire_lock(&self) -> Result<ConfigLock> {
         let path = self.root_config_path.clone();
         tokio::task::spawn_blocking(move || ConfigLock::acquire(&path))
             .await
-            .unwrap_or(ConfigLock { file: None })
+            .context("Credential-store lock task failed")?
     }
 
-    /// Read and parse the root config, or `None` when it is absent or corrupt.
-    fn read_root_config(path: &std::path::Path) -> Option<RailwayConfig> {
-        let mut file = File::open(path).ok()?;
+    /// Read and parse the root config. A missing store is new state; a store
+    /// that cannot be read or parsed is an operator-visible failure. Treating
+    /// the latter as an empty config would silently overwrite credentials on a
+    /// later write.
+    fn read_root_config(path: &std::path::Path) -> Result<Option<RailwayConfig>> {
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Unable to read Railway credential store at {}",
+                        path.display()
+                    )
+                });
+            }
+        };
         let mut buf = vec![];
-        file.read_to_end(&mut buf).ok()?;
-        serde_json::from_slice(&buf).ok()
+        file.read_to_end(&mut buf).with_context(|| {
+            format!(
+                "Unable to read Railway credential store at {}",
+                path.display()
+            )
+        })?;
+        serde_json::from_slice(&buf).map(Some).map_err(|error| {
+            // Serde errors can quote a credential value of the wrong type.
+            anyhow!(
+                "Railway credential store at {} is invalid (line {}, column {}); refusing to overwrite it. Restore a known-good backup before retrying.",
+                path.display(), error.line(), error.column()
+            )
+        })
     }
 
     pub fn get_environment_id() -> Environment {
@@ -990,11 +1010,11 @@ impl Configs {
     /// another process in the meantime. Credentials belong to the auth paths, so
     /// an ordinary write never carries them: see [`Self::write_credentials`].
     pub fn write(&self) -> Result<()> {
+        // Separate short-lived lock: refresh holds the session lock across HTTP.
+        let _write_lock = ConfigLock::acquire(&self.root_config_path.with_extension("write.json"))?;
         let mut to_write = serde_json::to_value(&self.root_config)?;
-        // Re-read immediately before writing so the window in which a
-        // concurrent refresh could be lost is microseconds rather than the
-        // lifetime of this `Configs`.
-        if let Some(disk) = Self::read_root_config(&self.root_config_path) {
+        // Re-read under the write lock, covering the merge through atomic rename.
+        if let Some(disk) = Self::read_root_config(&self.root_config_path)? {
             // Merge on the typed struct so the field set is checked by the
             // compiler: a new credential field on `RailwayUser` is picked up
             // automatically instead of being silently dropped. Everything that
@@ -1015,11 +1035,16 @@ impl Configs {
     /// ([`Self::save_oauth_tokens`]), a dead grant
     /// ([`Self::clear_oauth_tokens`]), and logout.
     pub(crate) fn write_credentials(&self) -> Result<()> {
+        let _write_lock = ConfigLock::acquire(&self.root_config_path.with_extension("write.json"))?;
         let value = serde_json::to_value(&self.root_config)?;
         self.write_value(&value)
     }
 
     fn write_value(&self, value: &serde_json::Value) -> Result<()> {
+        // Do not turn a malformed store into a valid-looking empty one. This
+        // validation is repeated here because credential writes intentionally
+        // do not merge from disk.
+        let _ = Self::read_root_config(&self.root_config_path)?;
         let config_dir = self
             .root_config_path
             .parent()
@@ -1117,6 +1142,60 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_store_diagnostics_never_quote_values_and_writes_preserve_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let bytes = br#"{"projects": {}, "user": {"tokenExpiresAt":"fixture-private-value"}}"#;
+        fs::write(&path, bytes).unwrap();
+        let config = Configs::for_test(path.clone());
+        let error = format!("{:#}", config.write_credentials().unwrap_err());
+        assert!(error.contains("invalid"));
+        assert!(!error.contains("fixture-private-value"));
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn lock_open_failure_is_not_an_unlocked_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::create_dir(path.with_extension("lock")).unwrap();
+        assert!(ConfigLock::acquire(&path).is_err());
+    }
+
+    #[test]
+    fn concurrent_write_lock_blocks_then_preserves_fresh_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut initial = Configs::for_test(path.clone());
+        initial.root_config.user.token = Some("old-fixture".into());
+        initial.write_credentials().unwrap();
+        let mut stale = Configs::for_test(path.clone());
+        stale.reload().unwrap();
+        let lock = ConfigLock::acquire(&path.with_extension("write.json")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let result = stale.write();
+            tx.send(result.is_ok()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        initial.root_config.user.token = Some("fresh-fixture".into());
+        initial
+            .write_value(&serde_json::to_value(&initial.root_config).unwrap())
+            .unwrap();
+        drop(lock);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap());
+        writer.join().unwrap();
+        initial.reload().unwrap();
+        assert_eq!(
+            initial.root_config.user.token.as_deref(),
+            Some("fresh-fixture")
+        );
+    }
+
+    #[test]
     fn env_var_project_id_only_returns_none_environment() {
         let result = with_env_vars(
             &[
@@ -1162,8 +1241,8 @@ mod tests {
     }
 }
 
-/// How long to wait for the config lock before giving up and proceeding without
-/// it. Kept short so a stale lock can never wedge the CLI for long.
+/// How long to wait for the config lock before returning a diagnostic. Kept
+/// short so a stale lock can never wedge the CLI for long.
 const CONFIG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Poll interval while waiting for the config lock.
 const CONFIG_LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -1171,39 +1250,48 @@ const CONFIG_LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from
 /// RAII guard around an exclusive advisory lock on the config lockfile.
 /// Releasing happens on drop, covering all error paths.
 pub(crate) struct ConfigLock {
-    file: Option<File>,
+    file: File,
 }
 
 impl ConfigLock {
     /// Acquire the lock guarding `config_path`. The lockfile is a sibling of the
     /// config (never the config itself, so locking cannot interfere with the
-    /// atomic rename). Failure to lock is non-fatal: proceeding unlocked is
-    /// strictly better than wedging the CLI, and the credential merge in `write`
-    /// still narrows the race to microseconds.
-    fn acquire(config_path: &std::path::Path) -> Self {
+    /// atomic rename). A caller must not continue to a credential write without
+    /// this lock: an unlocked refresh can reuse an already-consumed refresh
+    /// token and revoke the user's grant.
+    fn acquire(config_path: &std::path::Path) -> Result<Self> {
         let lock_path = config_path.with_extension("lock");
         if let Some(parent) = lock_path.parent() {
-            if create_dir_all(parent).is_err() {
-                return Self { file: None };
-            }
+            create_dir_all(parent).with_context(|| {
+                format!(
+                    "Unable to create credential-store lock directory at {}",
+                    parent.display()
+                )
+            })?;
         }
-        let Ok(file) = File::create(&lock_path) else {
-            return Self { file: None };
-        };
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| {
+                format!(
+                    "Unable to open credential-store lock at {}",
+                    lock_path.display()
+                )
+            })?;
 
         use fs2::FileExt;
         let deadline = std::time::Instant::now() + CONFIG_LOCK_TIMEOUT;
         loop {
             if file.try_lock_exclusive().is_ok() {
-                return Self { file: Some(file) };
+                return Ok(Self { file });
             }
             if std::time::Instant::now() >= deadline {
-                crate::util::reporter::warn(
-                    "CONFIG_LOCK_TIMEOUT",
-                    "timed out waiting for config lock; proceeding without it",
-                    None,
+                bail!(
+                    "Timed out waiting for credential-store lock at {}; refusing concurrent write",
+                    lock_path.display()
                 );
-                return Self { file: None };
             }
             std::thread::sleep(CONFIG_LOCK_POLL_INTERVAL);
         }
@@ -1212,10 +1300,8 @@ impl ConfigLock {
 
 impl Drop for ConfigLock {
     fn drop(&mut self) {
-        if let Some(file) = self.file.take() {
-            use fs2::FileExt;
-            let _ = FileExt::unlock(&file);
-        }
+        use fs2::FileExt;
+        let _ = FileExt::unlock(&self.file);
     }
 }
 

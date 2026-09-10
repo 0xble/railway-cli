@@ -94,6 +94,17 @@ impl RailwayMcp {
             .clone()
     }
 
+    /// Drop a client whose default headers may retain a revoked bearer token.
+    fn clear_client(&self) {
+        *self
+            .client
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = AuthedClient {
+            http: reqwest::Client::new(),
+            token: None,
+        };
+    }
+
     /// Re-resolve credentials from disk, refresh them if needed, and swap in a
     /// client carrying the current bearer token. Returns whether the token
     /// changed, i.e. whether a request that just failed on auth is worth
@@ -108,11 +119,13 @@ impl RailwayMcp {
     /// evicted by the per-grant refresh-token cap) while still looking valid
     /// here.
     ///
-    /// Failures are deliberately silent: stdout is the JSON-RPC channel, the
-    /// existing client may still work, and the tool call's own error is a better
-    /// signal than one from a speculative refresh.
+    /// Failures are deliberately silent: stdout is the JSON-RPC channel. A
+    /// failed credential reload discards the old bearer client, and the tool
+    /// call's own unauthenticated error is more useful than a speculative log.
     pub(crate) async fn sync_client(&self, force: bool) -> bool {
-        let Ok(mut configs) = Configs::new() else {
+        // Reload this server's pinned account, not the process-global selector.
+        let Ok(mut configs) = self.configs.reloaded() else {
+            self.clear_client();
             return false;
         };
         if force {
@@ -136,6 +149,7 @@ impl RailwayMcp {
         // A cleared token cannot authorize anything, so there is nothing to
         // install and no point retrying.
         if token.is_none() {
+            self.clear_client();
             return false;
         }
         match crate::client::GQLClient::new_authorized(&configs) {
@@ -147,7 +161,10 @@ impl RailwayMcp {
                     AuthedClient { http, token };
                 true
             }
-            Err(_) => false,
+            Err(_) => {
+                self.clear_client();
+                false
+            }
         }
     }
 
@@ -2091,6 +2108,63 @@ mod tests {
         assert_eq!(info.server_info.name, "railway");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
         assert!(info.instructions.is_some());
+    }
+
+    #[tokio::test]
+    async fn disk_logout_or_corruption_drops_cached_authorization() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for disk_state in [
+            Some(r#"{"projects": {}, "user": {}}"#),
+            Some("invalid-json"),
+            None,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.json");
+            std::fs::write(
+                &path,
+                r#"{"projects": {}, "user": {"token":"revoked-fixture"}}"#,
+            )
+            .unwrap();
+            let mut configs = Configs::for_test(path.clone());
+            configs.reload().unwrap();
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                "Bearer revoked-fixture".parse().unwrap(),
+            );
+            let http = reqwest::Client::builder()
+                .default_headers(headers)
+                .build()
+                .unwrap();
+            let mcp = RailwayMcp::new(http, configs);
+            match disk_state {
+                Some(bytes) => std::fs::write(&path, bytes).unwrap(),
+                None => std::fs::remove_file(&path).unwrap(),
+            }
+            assert!(!mcp.sync_client(false).await);
+            assert!(mcp.client.read().unwrap().token.is_none());
+            // reqwest adds default headers during send, not request.build().
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 8192];
+                let length = stream.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..length]).to_lowercase();
+                assert!(!request.contains("authorization:"));
+                assert!(!request.contains("revoked-fixture"));
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            });
+            mcp.client()
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            server.await.unwrap();
+        }
     }
 
     fn sample_domain() -> McpDomainDetails {

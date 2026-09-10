@@ -439,7 +439,7 @@ fn mark_refreshed(path: &std::path::Path) {
 /// refreshing concurrently means the second presents an already-consumed token
 /// and the server revokes the whole grant — a hard logout. Whichever process
 /// wins the lock performs the single refresh; the others re-read and pick up its
-/// result. If the lock cannot be taken we refresh anyway rather than wedge.
+/// result. If the lock cannot be taken, fail closed rather than reuse a token.
 ///
 /// `force` skips the "someone else already did it" short-circuit, for callers
 /// reacting to an actual authorization failure rather than to local expiry.
@@ -462,10 +462,16 @@ async fn refresh_locked_at(configs: &mut Configs, base_url: &str, force: bool) -
             "timed out waiting for an in-flight token refresh".to_string(),
         ));
     };
-    let _lock = configs.acquire_lock().await;
-
-    if configs.reload().is_err() {
-        return RefreshOutcome::NoRefreshToken;
+    let _lock = match configs.acquire_lock().await {
+        Ok(lock) => lock,
+        Err(error) => {
+            return RefreshOutcome::Transient(RailwayError::OAuthRefreshFailed(format!(
+                "{error:#}"
+            )));
+        }
+    };
+    if let Err(error) = configs.reload() {
+        return RefreshOutcome::Transient(RailwayError::OAuthRefreshFailed(format!("{error:#}")));
     }
     if !force && (!configs.has_oauth_token() || !configs.is_token_expired()) {
         return RefreshOutcome::AlreadyFresh;

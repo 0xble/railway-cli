@@ -1,3 +1,13 @@
 [alias]
 lint = "clippy --all-features --all-targets"
 lint-fix = "clippy --fix --allow-dirty --allow-staged --all-targets --all-features -- -D warnings"
+
+# The CLI's async dispatcher exceeds Windows' default 1 MiB main stack in
+# debug builds, even for --help. Match the 8 MiB stack available on Unix rather
+# than making the portable subprocess tests run a different optimized binary.
+# This reserves address space; pages are committed only as they are used.
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))']
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+[target.'cfg(all(target_os = "windows", target_env = "gnu"))']
+rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]

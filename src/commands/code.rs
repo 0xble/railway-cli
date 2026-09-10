@@ -15,6 +15,7 @@ use crate::commands::ssh::{
     ensure_ssh_key_quiet, probe_native_ssh, run_native_ssh_captured, run_native_ssh_with_opts,
 };
 use crate::config::Configs;
+use crate::controllers::cloud_agent as ca;
 use crate::controllers::project::get_project;
 use crate::errors::RailwayError;
 use crate::gql::{mutations, queries};
@@ -80,19 +81,36 @@ use crate::util::shell::shell_join;
 // `railway ca sleep`, or `s` on the TUI tree.
 // ---------------------------------------------------------------------------
 
+mod client;
 /// `railway code` is the launcher: it answers "where, and which harness"
 /// from flags and preferences, then opens that session. On a terminal it opens
 /// it inside `railway ca`'s manage screen with the tree collapsed, so the
 /// session has the whole window and the rest of the tool is one key away;
 /// everywhere else it hands the terminal straight to ssh.
 mod names;
-mod opencode;
 mod plumbing;
 mod saved_config;
 
 pub(crate) fn clear_saved_config() {
     if let Some(home) = dirs::home_dir() {
         saved_config::clear_in(&home);
+    }
+}
+
+pub(crate) fn save_desktop_configuration(
+    prepared: &Prepared,
+    connection: Option<&crate::commands::cloud_agent::opencode::Connection>,
+    beta: bool,
+    desktop: &Result<bool>,
+) {
+    let result = saved_config::SavedConfig::from_prepared(prepared)
+        .map(|saved| match connection {
+            Some(connection) => saved.with_opencode(connection, beta, desktop),
+            None => saved,
+        })
+        .and_then(|saved| saved.save());
+    if let Err(error) = result {
+        eprintln!("Could not save connection details for railway code get-config: {error:#}");
     }
 }
 
@@ -109,7 +127,7 @@ pub struct Args {
 
 #[derive(clap::Subcommand)]
 enum Commands {
-    /// Show the connection details saved by the last successful launch or reconnect
+    /// Show locally saved connection details for the latest or a named agent
     GetConfig(saved_config::Args),
 }
 
@@ -118,24 +136,55 @@ pub async fn command(args: Args) -> Result<()> {
         return saved_config::command(args);
     }
     let mut args = args.launch;
-    if let Some(action) = args.opencode_action()? {
-        let beta = args.opencode2;
+    if let Some(action) = args.client_action()? {
+        let harness = if args.codex {
+            client::Harness::Codex
+        } else if args.opencode2 {
+            client::Harness::OpenCode2
+        } else {
+            client::Harness::OpenCode
+        };
         match action {
-            OpenCodeAction::Local => return opencode::start(args, beta).await,
-            OpenCodeAction::Connect(selector) => {
-                return opencode::connect(args, beta, selector).await;
+            ClientAction::Local => {
+                return client::start(args, harness, client::LaunchMode::LocalClient).await;
             }
-            OpenCodeAction::Remote => {
+            ClientAction::DesktopOnly => {
+                return codex_desktop_only(args, Default::default()).await;
+            }
+            ClientAction::Connect(selector) => {
+                return client::connect(args, harness, selector).await;
+            }
+            ClientAction::Remote => {
                 args.agent_args.clear();
-                opencode::pin_agent(&mut args).await?;
+                client::pin_agent(&mut args).await?;
             }
         }
     }
     launch_in_cloud(args).await
 }
 
-/// CA's launch flags and OpenCode's `remote` action keep the in-agent UI.
+/// Canonical Codex Desktop setup, also used by `railway ca desktop --codex`.
+pub(crate) async fn codex_desktop_only(
+    mut args: LaunchArgs,
+    options: crate::commands::cloud_agent::desktop::CodexOptions,
+) -> Result<()> {
+    if args.client_action()? != Some(ClientAction::DesktopOnly) {
+        bail!("Expected railway code --codex desktop-only");
+    }
+    args.agent_args.clear();
+    client::start(
+        args,
+        client::Harness::Codex,
+        client::LaunchMode::DesktopOnly(options),
+    )
+    .await
+}
+
+/// CA's launch flags and the clients' `remote` action keep the in-agent UI.
 pub(crate) async fn launch_in_cloud(args: LaunchArgs) -> Result<()> {
+    if args.connection_json {
+        bail!("--connection-json requires railway code --codex or --opencode2 [connect].");
+    }
     // `railway code` passes its trailing arguments to the agent, so
     // `railway code setup` would silently run `setup` inside the VM. That is
     // never what someone typing it meant, and the failure is invisible — the
@@ -162,10 +211,76 @@ pub(crate) async fn launch_in_cloud(args: LaunchArgs) -> Result<()> {
 // they would show up in `--help`.
 #[derive(Parser, Default, Clone, Debug, PartialEq, Eq)]
 #[clap(
-    after_help = "Examples:\n\n  railway ca                        # launch your configured default\n  railway ca setup                  # choose the default agent and skills\n  railway code --codex              # agent VM + your local Codex sign-in\n  railway code --claude             # agent VM + your Claude setup-token\n  railway code --grok               # agent VM + your local Grok sign-in\n  railway code --opencode           # prepare a server, offer to open your local client\n  railway code --opencode2          # same, with OpenCode2 Beta\n  railway code --opencode remote    # run client and server inside railway ca\n  railway code --opencode2 --new\n  railway code --opencode2 connect  # choose an existing server, connect locally\n  railway code --opencode connect my-box\n  railway code --railway            # agent VM + Railway's own agent, no sign-in needed\n  railway code --codex --new        # force a fresh agent instead of reusing\n  railway code --codex --new --variable DB_URL=postgres.DATABASE_URL\n  railway code --codex --new --env-file .env\n  railway code --codex -- exec \"explain this codebase\"\n\nWith no agent flag, the default saved by `railway ca setup` is used\n(RAILWAY_CA_AGENT overrides it for one run). With no project or environment\nflag, this directory's linked project is used, and your default project when\nthe directory has no link.\n\n`--opencode` and `--opencode2` prepare a server and offer to open your local\nclient. Missing clients can be installed after confirmation. `connect [agent]`\nreconnects locally; `remote` runs the client inside Railway CA.\nLaunch and connect automatically save the connection in the matching Desktop\nedition when its settings file or database is detected. The final output\nreports success or a non-fatal configuration failure. You may need to restart\nOpenCode Desktop to load the updated configuration.\n\nSessions running inside `railway ca` open in its manage screen with the\ntree collapsed, so it has the whole window and the other agents are one key\naway — ⌥f brings the tree back, ⌥n starts another session. `--rm`, a `--`\npassthrough, and anything piped take the terminal directly instead; so does\n`railway ca start`, which never draws the TUI.\n\nAgents persist between runs and stay running when you disconnect, so your\nsessions survive to reattach to. `railway ca sleep <agent>` stops the compute\nbill; `railway code --rm` destroys it.\n\nClaude auth is minted once (`claude setup-token`), cached locally, and reused —\nincluding the copy already on a reused agent. `--refresh-auth` clears both\ncaches and re-mints.\n\nCarrying a sign-in from this machine is a convenience, not a requirement: with\nnothing local to copy or mint from, the agent still starts and the harness asks\nyou to sign in there.\n\nNote: requires the CLOUD_AGENTS feature to be enabled."
+    group(clap::ArgGroup::new("client_json_harness").args(["codex", "opencode2"]).multiple(true)),
+    after_help = r#"Examples:
+
+  railway ca                        # launch your configured default
+  railway ca setup                  # choose the default agent and skills
+  railway code --codex              # remote Codex server + local terminal client
+  railway code --codex connect      # choose a running Codex server
+  railway code --codex connect my-box
+  railway code --codex desktop-only # backend + Desktop configuration, then exit
+  railway code --codex desktop-only --agent my-box --dir /app
+  railway code get-config           # replay the latest saved connection
+  railway code get-config my-box    # replay a specific agent (name or ID)
+  railway code get-config my-box --json
+  railway code --codex remote       # run the Codex UI inside Railway CA
+  railway code --claude             # agent VM + your Claude setup-token
+  railway code --grok               # agent VM + your local Grok sign-in
+  railway code --opencode           # remote OpenCode server + local client
+  railway code --opencode2          # same, with OpenCode2 Beta
+  railway code --opencode remote    # run client and server inside Railway CA
+  railway code --opencode2 --new
+  railway code --opencode2 connect
+  railway code --opencode connect my-box
+  railway code --railway            # Railway's own agent, no sign-in needed
+  railway code --codex --new        # force a fresh agent instead of reusing
+  railway code --codex --new --variable DB_URL=postgres.DATABASE_URL
+  railway code --codex --new --env-file .env
+  railway code --codex -- exec "explain this codebase"
+
+With no agent flag, the default saved by `railway ca setup` is used
+(RAILWAY_CA_AGENT overrides it for one run). With no project or environment
+flag, this directory's linked project is used, and your default project when
+the directory has no link.
+
+`--codex`, `--opencode`, and `--opencode2` prepare a server and offer to open
+your local client. Missing clients can be installed after confirmation.
+`connect [agent]` reconnects locally; `remote` runs the client inside Railway CA.
+`--dir` selects the remote directory (default /app). `--connection-json`
+returns credentials as JSON for Codex or OpenCode2.
+Codex setup and connect also register and verify its SSH host and save its remote
+project in the background. Codex Desktop imports it on its next startup;
+setup never launches or activates the app.
+`railway code --codex desktop-only` prepares the same backend and Desktop
+connection, then exits without prompting for or launching a local terminal client.
+`railway ca desktop --codex` is an alias for this setup.
+OpenCode launch and connect automatically save the connection in the matching
+Desktop edition when its settings file or database is detected. The final output
+reports success or a non-fatal configuration failure. You may need to restart
+OpenCode Desktop to load the updated configuration.
+
+Sessions running inside `railway ca` open in its manage screen with the
+tree collapsed, so it has the whole window and the other agents are one key
+away — ⌥f brings the tree back, ⌥n starts another session. `--rm`, a `--`
+passthrough, and piped in-VM sessions take the terminal directly instead;
+so does `railway ca start`, which never draws the TUI.
+
+Agents persist between runs and stay running when you disconnect, so your
+sessions survive to reattach to. `railway ca sleep <agent>` stops the compute
+bill; `railway code --rm` destroys it.
+
+Claude auth is minted once (`claude setup-token`), cached locally, and reused —
+including the copy already on a reused agent. `--refresh-auth` clears both
+caches and re-mints.
+
+Carrying a sign-in from this machine is optional. With no local credential,
+sign in on the agent using the harness's login flow.
+
+Note: requires the CLOUD_AGENTS feature to be enabled."#
 )]
 pub struct LaunchArgs {
-    /// Launch OpenAI Codex, carrying your local ChatGPT sign-in
+    /// Prepare a Codex server and offer to launch your local client, carrying your ChatGPT sign-in
     /// (~/.codex/auth.json) when there is one to carry
     #[clap(long)]
     codex: bool,
@@ -177,6 +292,11 @@ pub struct LaunchArgs {
     /// Launch the latest OpenCode2 Beta, downloaded onto the agent at startup
     #[clap(long)]
     opencode2: bool,
+
+    /// Return Codex or OpenCode2 connection details as JSON, including credentials,
+    /// without launching a local client. Progress is written to stderr.
+    #[clap(long, requires = "client_json_harness")]
+    connection_json: bool,
 
     /// Launch Claude Code — runs `claude setup-token` for you to mint a
     /// token for the VM (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY env
@@ -248,14 +368,14 @@ pub struct LaunchArgs {
     #[clap(long, short)]
     pub project: Option<String>,
 
-    /// OpenCode action: local client by default, `remote` for CA, or `connect [AGENT]`
+    /// Client action: `remote`, `connect [AGENT]`, or Codex `desktop-only`
     agent_args: Vec<String>,
 
-    /// Remote project directory for OpenCode serve mode (default: /app)
+    /// Remote project directory for Codex/OpenCode server mode (default: /app)
     #[clap(long = "dir", value_name = "PATH")]
     remote_dir: Option<String>,
 
-    /// Existing cloud agent for OpenCode, by name or ID
+    /// Existing cloud agent for a local Codex/OpenCode client, by name or ID
     #[clap(long = "agent", value_name = "NAME_OR_ID", conflicts_with = "new")]
     remote_agent: Option<String>,
 
@@ -288,36 +408,51 @@ pub struct LaunchArgs {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum OpenCodeAction {
+enum ClientAction {
     Local,
+    DesktopOnly,
     Remote,
     Connect(Option<String>),
 }
 
 impl LaunchArgs {
-    /// Dispatch only the public OpenCode client commands; explicit harness
+    /// Dispatch only the public local-client commands; explicit harness
     /// arguments and CA's internal prepare/launch paths keep their VM semantics.
-    fn opencode_action(&self) -> Result<Option<OpenCodeAction>> {
+    fn client_action(&self) -> Result<Option<ClientAction>> {
         let verb = self.agent_args.first().map(String::as_str);
-        let reserved = matches!(verb, Some("remote" | "connect"));
-        let selected = self.opencode || self.opencode2;
+        if self.connection_json
+            && ((!self.codex && !self.opencode2)
+                || self.rm
+                || self.app_mode
+                || !(matches!(verb, None | Some("connect"))
+                    || (self.codex && verb == Some("desktop-only"))))
+        {
+            bail!(
+                "--connection-json requires railway code --codex or --opencode2 [connect], or --codex desktop-only."
+            );
+        }
+        let reserved = matches!(verb, Some("remote" | "connect" | "desktop-only"));
+        let selected = self.codex || self.opencode || self.opencode2;
         if !reserved && (!selected || !self.agent_args.is_empty() || self.rm || self.app_mode) {
             if self.remote_dir.is_some() || self.remote_agent.is_some() {
-                bail!("--dir and --agent require an OpenCode client command.");
+                bail!("--dir and --agent require a Codex or OpenCode client command.");
             }
             return Ok(None);
         }
-        if self.opencode == self.opencode2
-            || self.codex
+        if [self.codex, self.opencode, self.opencode2]
+            .into_iter()
+            .filter(|selected| *selected)
+            .count()
+            != 1
             || self.claude
             || self.grok
             || self.railway
             || self.shell
         {
-            bail!("Pick exactly one OpenCode edition: --opencode or --opencode2.");
+            bail!("Pick exactly one client: --codex, --opencode, or --opencode2.");
         }
         if self.rm || self.initial_prompt.is_some() {
-            bail!("OpenCode client commands cannot be combined with --rm or an initial prompt.");
+            bail!("Local-client commands cannot be combined with --rm or an initial prompt.");
         }
         if self
             .remote_dir
@@ -327,14 +462,22 @@ impl LaunchArgs {
             bail!("--dir must name a directory on the agent.");
         }
         match verb {
-            None => Ok(Some(OpenCodeAction::Local)),
+            None => Ok(Some(ClientAction::Local)),
+            Some("desktop-only") => {
+                if !self.codex || self.agent_args.len() != 1 || self.app_mode {
+                    bail!(
+                        "Use railway code --codex desktop-only [--agent NAME_OR_ID] [--dir PATH] [--new]."
+                    );
+                }
+                Ok(Some(ClientAction::DesktopOnly))
+            }
             Some("remote") => {
                 if self.agent_args.len() != 1 || self.remote_dir.is_some() {
                     bail!(
-                        "Use railway code --opencode remote to open OpenCode inside the cloud agent; --dir is for local clients."
+                        "Use railway code --codex remote (or --opencode/--opencode2) to open the UI inside the cloud agent; --dir is for local clients."
                     );
                 }
-                Ok(Some(OpenCodeAction::Remote))
+                Ok(Some(ClientAction::Remote))
             }
             Some("connect") => {
                 if self.agent_args.len() > 2
@@ -346,7 +489,7 @@ impl LaunchArgs {
                     || self.remote_dir.is_some()
                 {
                     bail!(
-                        "connect uses an existing server. Use railway code --opencode [--new] to set one up."
+                        "connect uses an existing server. Use railway code --codex, --opencode, or --opencode2 [--new] to set one up."
                     );
                 }
                 let positional = self.agent_args.get(1).cloned();
@@ -360,7 +503,7 @@ impl LaunchArgs {
                 {
                     bail!("The cloud agent name cannot be empty.");
                 }
-                Ok(Some(OpenCodeAction::Connect(selector)))
+                Ok(Some(ClientAction::Connect(selector)))
             }
             _ => unreachable!("other harness arguments returned above"),
         }
@@ -372,6 +515,7 @@ impl LaunchArgs {
         !self.codex
             && !self.opencode
             && !self.opencode2
+            && !self.connection_json
             && !self.claude
             && !self.grok
             && !self.railway
@@ -498,6 +642,25 @@ impl LaunchArgs {
         };
         args.set_harness(harness);
         args
+    }
+
+    pub(crate) fn for_codex_desktop(
+        project: Option<String>,
+        environment: Option<String>,
+        agent: Option<String>,
+        directory: String,
+        new: bool,
+    ) -> Self {
+        Self {
+            codex: true,
+            project,
+            environment,
+            remote_agent: agent,
+            remote_dir: Some(directory),
+            new,
+            agent_args: vec!["desktop-only".into()],
+            ..Self::default()
+        }
     }
 }
 
@@ -1818,44 +1981,10 @@ fn ssh_plumbing(
     bail!("SSH to the agent failed after {attempts} attempts (exit {code}):\n{reason}")
 }
 
-/// One cloud agent, reduced to what this command steers on. `pub(crate)`
-/// because [`wait_until_connectable`] returns it to the `railway ca` verbs.
-#[derive(Clone)]
-pub(crate) struct CodeAgent {
-    id: String,
-    name: String,
-    status: queries::cloud_agent::CloudAgentStatus,
-}
-
 /// How long to wait for a created or woken agent to reach RUNNING before
 /// giving up. A cold create boots a microVM and publishes routes; a wake
 /// restores a checkpoint and is much quicker.
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
-
-/// Read one agent by id, scoped to the environment. `None` means it is gone
-/// (deleted, or it belongs to another environment) — the caller's cue to forget
-/// its stored pointer rather than to fail.
-async fn fetch_agent(
-    client: &reqwest::Client,
-    backboard: &str,
-    environment_id: &str,
-    id: &str,
-) -> Result<Option<CodeAgent>> {
-    let res = post_graphql::<queries::CloudAgent, _>(
-        client,
-        backboard,
-        queries::cloud_agent::Variables {
-            id: id.to_owned(),
-            environment_id: environment_id.to_owned(),
-        },
-    )
-    .await?;
-    Ok(res.cloud_agent.map(|a| CodeAgent {
-        id: a.id,
-        name: a.name,
-        status: a.status,
-    }))
-}
 
 /// Wait until the agent is *connectable*, by probing the SSH route itself
 /// rather than polling status up to RUNNING. The platform routes a shell as
@@ -1900,8 +2029,8 @@ pub(crate) async fn wait_until_connectable(
     id: &str,
     access: &RelayAccess,
     initial_delay: std::time::Duration,
-) -> Result<(CodeAgent, Option<std::path::PathBuf>)> {
-    use queries::cloud_agent::CloudAgentStatus as S;
+) -> Result<(ca::Agent, Option<std::path::PathBuf>)> {
+    use ca::Status as S;
     // Measured as one stage because this is the leg the platform owns — VM
     // boot/restore up to a routable SSH target. Per-round detail goes to stderr
     // under RAILWAY_STAGE_TIMING; the recorded stage is what telemetry sees.
@@ -1924,7 +2053,7 @@ pub(crate) async fn wait_until_connectable(
     // it ride the probe cadence would triple backboard polling per launching
     // client for nothing. Round 1 always fetches.
     let mut last_fetch: Option<std::time::Instant> = None;
-    let mut last_agent: Option<CodeAgent> = None;
+    let mut last_agent: Option<ca::Agent> = None;
     loop {
         round += 1;
         let round_started = std::time::Instant::now();
@@ -1949,28 +2078,28 @@ pub(crate) async fn wait_until_connectable(
         // on its full ConnectTimeout against a box that will never answer.
         let fetch_due = last_fetch.is_none_or(|at| at.elapsed().as_millis() >= 700);
         if fetch_due {
-            let agent = fetch_agent(client, backboard, environment_id, id)
+            let agent = ca::get(client, backboard, environment_id, id)
                 .await?
                 .ok_or_else(|| anyhow!("Agent {id} disappeared while starting."))?;
             last_fetch = Some(std::time::Instant::now());
             match agent.status {
-                S::RUNNING | S::STARTING | S::SLEEPING => {}
-                S::CRASHED => bail!(
+                S::Running | S::Starting | S::Sleeping => {}
+                S::Crashed => bail!(
                     "Agent {} crashed while starting. `railway code --new` for a fresh one.",
                     agent.name
                 ),
-                S::FAILED => bail!(
+                S::Failed => bail!(
                     "Agent {} failed to start. `railway code --new` for a fresh one.",
                     agent.name
                 ),
-                S::DELETING => bail!("Agent {} is being deleted.", agent.name),
-                S::Other(ref s) => bail!("Agent {} is in an unknown state ({s}).", agent.name),
+                S::Deleting => bail!("Agent {} is being deleted.", agent.name),
+                S::Unknown(ref s) => bail!("Agent {} is in an unknown state ({s}).", agent.name),
             }
             // RUNNING routes by definition, so don't spend another round on a
             // probe that lost the race to the status flip — but there is no
             // verified connection to promote (the in-flight probe is abandoned;
             // its master, if any, exits on the persist backstop).
-            if agent.status == S::RUNNING {
+            if agent.status == S::Running {
                 ssh_tel::record_stage("wait_connectable", wait_started.elapsed(), true);
                 return Ok((agent, None));
             }
@@ -2038,36 +2167,35 @@ fn release_probe_master(socket: &std::path::Path, target: &str) {
         .spawn();
 }
 
-/// Bring an agent that already exists up to RUNNING: reuse it when it is
-/// already up, wake it when it is asleep or still booting. `None` means the
-/// agent is dead and the caller should create a fresh one.
+/// Connect to the selected agent, waking it when needed. An unusable observation
+/// is an error on this agent, never permission to replace it with another VM.
 async fn ready_existing_agent(
     client: &reqwest::Client,
     backboard: &str,
     environment_id: &str,
-    agent: CodeAgent,
+    agent: ca::Agent,
     progress: &dyn Progress,
     access: &RelayAccess,
-) -> Result<Option<(CodeAgent, Option<std::path::PathBuf>)>> {
-    use queries::cloud_agent::CloudAgentStatus as S;
+) -> Result<(ca::Agent, Option<std::path::PathBuf>)> {
+    use ca::Status as S;
 
     match agent.status {
-        S::RUNNING => {
+        S::Running => {
             progress.note(&format!(
                 "Using agent {} (--new for a fresh one)",
                 agent.name
             ));
-            Ok(Some((agent, None)))
+            Ok((agent, None))
         }
         // STARTING means a previous run is still booting it, so a re-run seconds
         // after a ctrl-c waits rather than minting a duplicate. SLEEPING is the
         // resting state this command leaves behind.
-        S::SLEEPING | S::STARTING => {
+        S::Sleeping | S::Starting => {
             progress.step(&format!("Waking agent {}", agent.name));
             // The delay below is the wake's physical floor; a STARTING agent
             // caught mid-boot gets none — it may be routable right now.
             let mut probe_delay = std::time::Duration::ZERO;
-            if agent.status == S::SLEEPING {
+            if agent.status == S::Sleeping {
                 let wake_started = std::time::Instant::now();
                 let wake = post_graphql::<mutations::CloudAgentWake, _>(
                     client,
@@ -2096,19 +2224,17 @@ async fn ready_existing_agent(
                 "Woke agent {} — your work is on its disk",
                 running.name
             ));
-            Ok(Some((running, probe_master)))
+            Ok((running, probe_master))
         }
-        S::CRASHED | S::FAILED | S::DELETING | S::Other(_) => {
-            progress.note(&format!(
-                "Agent {} is {:?}; creating a fresh one.",
-                agent.name, agent.status
-            ));
-            Ok(None)
-        }
+        S::Crashed | S::Failed | S::Deleting | S::Unknown(_) => bail!(
+            "Agent {} is reported as {} and cannot be connected to. Check `railway ca list` and retry, or use `railway code --new` to create a separate agent.",
+            agent.name,
+            agent.status.label()
+        ),
     }
 }
 
-/// The caller's own live agent in this environment, when there is exactly one.
+/// The caller's own agent in this environment, when there is exactly one.
 ///
 /// `mine` is load-bearing rather than tidiness: agents authorize per
 /// environment, so an unfiltered list includes teammates' — and adopting one
@@ -2118,23 +2244,11 @@ async fn sole_owned_agent_id(
     backboard: &str,
     environment_id: &str,
 ) -> Result<Option<String>> {
-    use queries::cloud_agents::CloudAgentStatus as S;
+    // A failed or unknown observation still names an existing VM. Filtering it
+    // out would turn an inconclusive lookup into a new billed agent.
+    let agents = ca::list_in_environment(client, backboard, environment_id, true).await?;
 
-    let live: Vec<_> = post_graphql::<queries::CloudAgents, _>(
-        client,
-        backboard,
-        queries::cloud_agents::Variables {
-            environment_id: environment_id.to_owned(),
-            mine: Some(true),
-        },
-    )
-    .await?
-    .cloud_agents
-    .into_iter()
-    .filter(|a| matches!(a.status, S::RUNNING | S::SLEEPING | S::STARTING))
-    .collect();
-
-    match live.as_slice() {
+    match agents.as_slice() {
         [] => Ok(None),
         [only] => Ok(Some(only.id.clone())),
         many => bail!(
@@ -2403,7 +2517,7 @@ async fn resolve_agent(
     harness: Agent,
     progress: &dyn Progress,
     access: &RelayAccess,
-) -> Result<(CodeAgent, bool, Option<std::path::PathBuf>)> {
+) -> Result<(ca::Agent, bool, Option<std::path::PathBuf>)> {
     let environment_id = target.environment_id.as_str();
     let backboard = configs.get_backboard();
 
@@ -2418,23 +2532,27 @@ async fn resolve_agent(
             None => sole_owned_agent_id(client, &backboard, environment_id).await?,
         },
     };
-    // Re-read by id either way, so both paths carry the same shape and the
-    // stale-pointer case (agent deleted elsewhere) collapses into `None`.
-    let existing = match candidate {
-        Some(id) => fetch_agent(client, &backboard, environment_id, &id).await?,
-        None => None,
-    };
-    if let Some(agent) = existing {
-        if let Some((ready, probe_master)) =
+    // Once a target is selected, keep it even when its observation is missing
+    // or unusable. Creating is reserved for an empty inventory or explicit --new.
+    if let Some(id) = candidate {
+        let agent = ca::get(client, &backboard, environment_id, &id)
+            .await?
+            .ok_or_else(|| anyhow!(
+                "Agent {id} is unavailable in this environment. Check `railway ca list`, or use `railway code --new` to create a separate agent."
+            ))?;
+        let (ready, probe_master) =
             ready_existing_agent(client, &backboard, environment_id, agent, progress, access)
-                .await?
-        {
-            warn_ignored_variables(args, progress);
-            configs.set_code_agent(environment_id, &ready.id);
-            configs.write()?;
-            return Ok((ready, false, probe_master));
-        }
-        configs.remove_code_agent(environment_id);
+                .await?;
+        warn_ignored_variables(args, progress);
+        configs.set_code_agent(environment_id, &ready.id);
+        configs.write()?;
+        return Ok((ready, false, probe_master));
+    }
+
+    if args.connection_json && args.agent_id.is_some() {
+        bail!(
+            "The selected cloud agent is unavailable. Refresh the agent list before reconnecting."
+        );
     }
 
     let mut variables = variables_to_input(&args.env_files, &args.variables)?
@@ -2532,7 +2650,7 @@ async fn destroy_agent(
         println!("No agent recorded for this environment.");
         return Ok(());
     };
-    let name = fetch_agent(client, &backboard, environment_id, &id)
+    let name = ca::get(client, &backboard, environment_id, &id)
         .await?
         .map(|a| a.name);
     // Forget the pointer either way: a delete that reports failure on an
@@ -2756,6 +2874,10 @@ pub async fn resolve_launch(
 
 pub async fn launch(args: LaunchArgs) -> Result<()> {
     use colored::Colorize;
+
+    if args.connection_json {
+        bail!("--connection-json requires railway code --codex or --opencode2 [connect].");
+    }
 
     // `--rm` is a lifecycle action, not a launch: it needs no agent choice and
     // no credential, so it resolves the environment and returns.
@@ -3553,7 +3675,122 @@ pub fn ensure_claude_credential_cached(harness: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::MockBackboard;
     use clap::Parser;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn an_unusable_selected_vm_is_never_replaced() {
+        for selection in ["explicit", "remembered", "sole"] {
+            for status in [
+                "FAILED",
+                "CRASHED",
+                "DELETING",
+                "FUTURE_STATE",
+                "missing",
+                "lookup_error",
+            ] {
+                let server = MockBackboard::spawn();
+                let dir = tempfile::tempdir().unwrap();
+                let mut configs = server.configs(&dir);
+                let mut args = LaunchArgs::default();
+                if selection == "explicit" {
+                    args.agent_id = Some("existing".into());
+                } else if selection == "remembered" {
+                    configs.set_code_agent("env", "existing");
+                }
+                configs.write().unwrap();
+                let saved = std::fs::read(dir.path().join("config.json")).unwrap();
+                let node = json!({
+                    "id": "existing", "name": "my-agent", "status": status,
+                    "projectId": "project", "environmentId": "env",
+                    "createdAt": "2026-09-10T00:00:00Z"
+                });
+                server.stub("CloudAgents", json!({"cloudAgents": [node.clone()]}));
+                match status {
+                    "missing" => server.stub("CloudAgent", json!({"cloudAgent": null})),
+                    "lookup_error" => {
+                        server.stub_graphql_error("CloudAgent", "temporarily unavailable")
+                    }
+                    _ => server.stub("CloudAgent", json!({"cloudAgent": node})),
+                }
+                let error = resolve_agent(
+                    &mut configs,
+                    &reqwest::Client::new(),
+                    &args,
+                    &names::Target::new(("project".into(), "env".into()), false),
+                    Agent::Claude,
+                    &CliProgress::default(),
+                    &RelayAccess {
+                        identity: None,
+                        relay_opts: vec![],
+                    },
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    !error.to_string().contains("no scripted response"),
+                    "{selection}/{status}: {error}"
+                );
+                let operations: Vec<_> = server
+                    .requests()
+                    .iter()
+                    .map(|r| r["operationName"].as_str().unwrap().to_owned())
+                    .collect();
+                let expected = if selection == "sole" {
+                    vec!["CloudAgents", "CloudAgent"]
+                } else {
+                    vec!["CloudAgent"]
+                };
+                assert_eq!(operations, expected, "{selection}/{status}");
+                assert_eq!(
+                    std::fs::read(dir.path().join("config.json")).unwrap(),
+                    saved
+                );
+                if selection == "remembered" {
+                    assert_eq!(configs.get_code_agent("env").as_deref(), Some("existing"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn creation_is_reached_only_for_new_or_an_empty_inventory() {
+        for new in [false, true] {
+            let server = MockBackboard::spawn();
+            let dir = tempfile::tempdir().unwrap();
+            let mut configs = server.configs(&dir);
+            if new {
+                configs.set_code_agent("env", "existing");
+            }
+            server.stub("CloudAgents", json!({"cloudAgents": []}));
+            // Stop at creation so the test never opens SSH or provisions a VM.
+            server.stub_graphql_error("CloudAgentCreate", "creation reached");
+            let args = LaunchArgs {
+                new,
+                name: Some("fresh-agent".into()),
+                ..Default::default()
+            };
+            let error = resolve_agent(
+                &mut configs,
+                &reqwest::Client::new(),
+                &args,
+                &names::Target::new(("project".into(), "env".into()), false),
+                Agent::Claude,
+                &CliProgress::default(),
+                &RelayAccess {
+                    identity: None,
+                    relay_opts: vec![],
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("creation reached"), "{error}");
+            assert_eq!(server.variables_for("CloudAgentCreate").len(), 1);
+            assert!(server.variables_for("CloudAgent").is_empty());
+            assert_eq!(server.variables_for("CloudAgents").len(), usize::from(!new));
+        }
+    }
 
     /// The shapes someone types at a prompt open in the pane. Nothing about a
     /// target, a harness or a variable changes that — they all describe a
@@ -3761,24 +3998,107 @@ mod tests {
     }
 
     #[test]
-    fn opencode_actions_separate_local_clients_from_cloud_terminal_sessions() {
-        for flag in ["--opencode", "--opencode2"] {
+    fn connection_json_only_accepts_server_connection_actions() {
+        for flag in ["--codex", "--opencode2"] {
+            for extra in [vec![], vec!["connect", "box"], vec!["--new"]] {
+                let args = LaunchArgs::try_parse_from(
+                    [vec!["code", flag, "--connection-json"], extra].concat(),
+                )
+                .unwrap();
+                assert!(args.connection_json);
+                assert!(args.client_action().unwrap().is_some());
+            }
+            for extra in [vec!["remote"], vec!["--rm"], vec!["--", "run", "hello"]] {
+                let args = LaunchArgs::try_parse_from(
+                    [vec!["code", flag, "--connection-json"], extra].concat(),
+                )
+                .unwrap();
+                assert!(args.client_action().is_err());
+            }
+        }
+        assert!(LaunchArgs::try_parse_from(["code", "--connection-json"]).is_err());
+    }
+
+    #[test]
+    fn codex_desktop_only_accepts_backend_setup_flags_and_json() {
+        for argv in [
+            vec!["code", "--codex", "desktop-only"],
+            vec![
+                "code",
+                "--codex",
+                "desktop-only",
+                "--agent",
+                "box",
+                "--dir",
+                "/app/project",
+            ],
+            vec![
+                "code",
+                "--codex",
+                "--new",
+                "desktop-only",
+                "--name",
+                "desktop-box",
+                "--variable",
+                "A=B",
+                "--env-file",
+                ".env",
+            ],
+            vec![
+                "code",
+                "--codex",
+                "--connection-json",
+                "desktop-only",
+                "-p",
+                "project",
+                "-e",
+                "env",
+            ],
+        ] {
+            let args = LaunchArgs::try_parse_from(argv).unwrap();
+            assert_eq!(
+                args.client_action().unwrap(),
+                Some(ClientAction::DesktopOnly)
+            );
+            assert!(!args.pane_shaped());
+        }
+    }
+
+    #[test]
+    fn desktop_only_rejects_other_harnesses_and_session_arguments() {
+        for argv in [
+            vec!["code", "desktop-only"],
+            vec!["code", "--opencode", "desktop-only"],
+            vec!["code", "--opencode2", "desktop-only"],
+            vec!["code", "--grok", "desktop-only"],
+            vec!["code", "--claude", "desktop-only"],
+            vec!["code", "--codex", "--claude", "desktop-only"],
+            vec!["code", "--codex", "desktop-only", "box"],
+            vec!["code", "--codex", "desktop-only", "connect"],
+            vec!["code", "--codex", "desktop-only", "--rm"],
+            vec!["code", "--codex", "desktop-only", "--dir", " "],
+        ] {
+            let args = LaunchArgs::try_parse_from(argv).unwrap();
+            assert!(args.client_action().is_err(), "{args:?}");
+        }
+        let mut args = LaunchArgs::try_parse_from(["code", "--codex", "desktop-only"]).unwrap();
+        args.initial_prompt = Some("run tests".into());
+        assert!(args.client_action().is_err());
+    }
+
+    #[test]
+    fn client_actions_separate_local_clients_from_cloud_terminal_sessions() {
+        for flag in ["--codex", "--opencode", "--opencode2"] {
             let local =
                 LaunchArgs::try_parse_from(["code", flag, "--new", "--dir", "/app/project"])
                     .unwrap();
-            assert_eq!(
-                local.opencode_action().unwrap(),
-                Some(OpenCodeAction::Local)
-            );
+            assert_eq!(local.client_action().unwrap(), Some(ClientAction::Local));
             for argv in [
                 vec!["code", flag, "remote", "--new"],
                 vec!["code", flag, "--new", "remote"],
             ] {
                 let mut remote = LaunchArgs::try_parse_from(argv).unwrap();
-                assert_eq!(
-                    remote.opencode_action().unwrap(),
-                    Some(OpenCodeAction::Remote)
-                );
+                assert_eq!(remote.client_action().unwrap(), Some(ClientAction::Remote));
                 remote.agent_args.clear();
                 assert!(remote.pane_shaped());
             }
@@ -3793,8 +4113,8 @@ mod tests {
                 let args =
                     LaunchArgs::try_parse_from([vec!["code", flag], extra].concat()).unwrap();
                 assert_eq!(
-                    args.opencode_action().unwrap(),
-                    Some(OpenCodeAction::Connect(expected))
+                    args.client_action().unwrap(),
+                    Some(ClientAction::Connect(expected))
                 );
             }
         }
@@ -3803,7 +4123,9 @@ mod tests {
     #[test]
     fn opencode_rejects_ambiguous_or_destructive_client_actions() {
         for argv in [
-            vec!["code", "--codex", "connect"],
+            vec!["code", "--codex", "--opencode", "connect"],
+            vec!["code", "--codex", "connect", "--new"],
+            vec!["code", "--codex", "remote", "--dir", "/app"],
             vec!["code", "remote"],
             vec!["code", "--opencode", "--opencode2"],
             vec!["code", "--opencode", "remote", "extra"],
@@ -3818,7 +4140,7 @@ mod tests {
             assert!(
                 LaunchArgs::try_parse_from(argv)
                     .unwrap()
-                    .opencode_action()
+                    .client_action()
                     .is_err()
             );
         }
@@ -3828,7 +4150,7 @@ mod tests {
         assert_eq!(
             LaunchArgs::try_parse_from(["code", "--opencode", "--rm"])
                 .unwrap()
-                .opencode_action()
+                .client_action()
                 .unwrap(),
             None
         );
@@ -3857,7 +4179,7 @@ mod tests {
                 "/project"
             ]
         );
-        assert_eq!(args.opencode_action().unwrap(), None);
+        assert_eq!(args.client_action().unwrap(), None);
         assert_eq!(args.remote_dir, None);
     }
 
