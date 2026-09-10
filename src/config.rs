@@ -232,10 +232,21 @@ impl Configs {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     }
 
+    fn credential_home_dir() -> Result<PathBuf> {
+        // Windows' known-folder API ignores HOME/USERPROFILE. Subprocess tests
+        // must never fall through to the developer's actual credential store.
+        // Like the mock-backboard override, this is absent from release builds.
+        #[cfg(debug_assertions)]
+        if let Some(home) = std::env::var_os("RAILWAY_TEST_HOME") {
+            let home = PathBuf::from(home);
+            anyhow::ensure!(home.is_absolute(), "RAILWAY_TEST_HOME must be absolute");
+            return Ok(home);
+        }
+        dirs::home_dir().context("Unable to get home directory")
+    }
+
     fn accounts_dir() -> Result<PathBuf> {
-        Ok(dirs::home_dir()
-            .context("Unable to get home directory")?
-            .join(Self::accounts_relative_dir()))
+        Ok(Self::credential_home_dir()?.join(Self::accounts_relative_dir()))
     }
 
     pub fn new() -> Result<Self> {
@@ -290,7 +301,7 @@ impl Configs {
             Environment::Dev => ".railway/config-dev.json",
         };
 
-        let home_dir = dirs::home_dir().context("Unable to get home directory")?;
+        let home_dir = Self::credential_home_dir()?;
         Ok(Path::new(&home_dir).join(root_config_partial_path))
     }
 

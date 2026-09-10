@@ -17,6 +17,7 @@ fn run(home: &Path, args: &[&str]) -> Output {
     }
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
+        .env("RAILWAY_TEST_HOME", home)
         .env("DO_NOT_TRACK", "1")
         .env("RAILWAY_NO_AUTO_UPDATE", "1")
         .env("RAILWAY_API_TOKEN", "synthetic-ambient")

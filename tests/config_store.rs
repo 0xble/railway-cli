@@ -1,13 +1,19 @@
 //! Credential-store corruption is handled at the public CLI boundary.
-#![cfg(unix)]
 
 use std::{fs, path::Path, process::Command};
 
 fn command(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_railway"));
+    command.env_clear();
+    for key in ["SystemRoot", "WINDIR"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
     command
-        .env_clear()
         .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("RAILWAY_TEST_HOME", home)
         .env("PATH", "/usr/bin:/bin")
         .env("DO_NOT_TRACK", "1")
         .env("RAILWAY_NO_AUTO_UPDATE", "1")

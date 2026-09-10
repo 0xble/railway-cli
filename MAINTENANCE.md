@@ -50,6 +50,9 @@ Accepted upstream baseline: `17c8e2d` (5.52.0); publish only to `fork`.
 - Windows MSVC/GNU binaries reserve an 8 MiB main stack for the async dispatcher;
   the debug executable otherwise overflows before even parsing `--help`.
   Portable subprocess tests exercise the actual debug binary without skipping.
+- Debug-only `RAILWAY_TEST_HOME` isolates subprocess credential fixtures on
+  Windows, whose known-folder API ignores HOME/USERPROFILE. It must be absolute
+  and is compiled out of release builds; release credential routing is unchanged.
 - Tests: config lock/contention/redaction unit tests; config_store subprocess
   tests; actual loopback MCP no-Authorization regression; fork updater unit and
   package-manager subprocess refusal tests.
