@@ -8,6 +8,7 @@ pub fn get_dynamic_args(cmd: clap::Command) -> clap::Command {
     cmd
 }
 
+pub mod account;
 pub mod add;
 pub mod api;
 pub mod autoupdate;

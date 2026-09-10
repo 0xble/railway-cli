@@ -52,6 +52,11 @@ macro_rules! commands {
                     }
                 )*
                 cmd = cmd
+                    .arg(::clap::Arg::new("account")
+                        .long("account")
+                        .value_name("NAME")
+                        .help("Named Railway account; required when more than one account is configured")
+                        .global(true))
                     .mut_subcommand("list", |cmd| cmd.visible_alias("ls"))
                     .mut_subcommand("delete", |cmd| {
                         cmd.visible_alias("rm").visible_alias("remove")

@@ -2,7 +2,8 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, create_dir_all},
     io::Read,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -128,7 +129,89 @@ pub enum Environment {
     Dev,
 }
 
+/// Process-local selection is set by the root parser. It is intentionally not
+/// an environment variable or a remembered default: once more than one account
+/// exists, the invocation must name the account it is about to use.
+static ACCOUNT_SELECTION: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn account_selection() -> &'static Mutex<Option<String>> {
+    ACCOUNT_SELECTION.get_or_init(|| Mutex::new(None))
+}
+
 impl Configs {
+    pub fn set_account_selection(account: Option<String>) {
+        *account_selection()
+            .lock()
+            .expect("account selection lock poisoned") = account;
+    }
+
+    pub fn account_names() -> Result<Vec<String>> {
+        let dir = Self::accounts_dir()?;
+        let mut names = Vec::new();
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                    && let Some(name) = path.file_stem().and_then(|name| name.to_str())
+                    && Self::valid_account_name(name)
+                {
+                    names.push(name.to_owned());
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    pub fn resolve_account(requested: Option<&str>, allow_new: bool) -> Result<Option<String>> {
+        let names = Self::account_names()?;
+        if let Some(name) = requested {
+            if !Self::valid_account_name(name) {
+                bail!("Invalid account name {name:?}. Use letters, numbers, '.', '_' or '-'.");
+            }
+            if allow_new || names.iter().any(|candidate| candidate == name) {
+                return Ok(Some(name.to_owned()));
+            }
+            bail!(
+                "Unknown account {name:?}. Run `railway account list` or `railway login --account {name}`."
+            );
+        }
+        match names.len() {
+            0 => Ok(None),
+            1 => Ok(names.first().cloned()),
+            _ => bail!(
+                "Multiple Railway accounts are configured. Re-run with `--account <NAME>`; see `railway account list`."
+            ),
+        }
+    }
+
+    pub fn legacy_config_path() -> Result<PathBuf> {
+        Self::legacy_root_config_path()
+    }
+
+    pub fn account_config_path(name: &str) -> Result<PathBuf> {
+        if !Self::valid_account_name(name) {
+            bail!("Invalid account name {name:?}.");
+        }
+        Ok(Self::accounts_dir()?.join(format!("{name}.json")))
+    }
+
+    fn valid_account_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    }
+
+    fn accounts_dir() -> Result<PathBuf> {
+        Ok(dirs::home_dir()
+            .context("Unable to get home directory")?
+            .join(".railway/accounts"))
+    }
+
     pub fn new() -> Result<Self> {
         let root_config_path = Self::root_config_path()?;
 
@@ -186,6 +269,17 @@ impl Configs {
 
     /// Absolute path to the root config file for the current environment.
     fn root_config_path() -> Result<PathBuf> {
+        if let Some(name) = account_selection()
+            .lock()
+            .expect("account selection lock poisoned")
+            .clone()
+        {
+            return Self::account_config_path(&name);
+        }
+        Self::legacy_root_config_path()
+    }
+
+    fn legacy_root_config_path() -> Result<PathBuf> {
         let root_config_partial_path = match Self::get_environment_id() {
             Environment::Production => ".railway/config.json",
             Environment::Staging => ".railway/config-staging.json",
@@ -193,7 +287,7 @@ impl Configs {
         };
 
         let home_dir = dirs::home_dir().context("Unable to get home directory")?;
-        Ok(std::path::Path::new(&home_dir).join(root_config_partial_path))
+        Ok(Path::new(&home_dir).join(root_config_partial_path))
     }
 
     /// Re-read the root config from disk, discarding any in-memory state.
@@ -210,10 +304,26 @@ impl Configs {
     }
 
     pub fn get_railway_token() -> Option<String> {
+        // A named account never falls back to a process-wide token; it would
+        // silently let one account invocation use another identity.
+        if account_selection()
+            .lock()
+            .expect("account selection lock poisoned")
+            .is_some()
+        {
+            return None;
+        }
         std::env::var(consts::RAILWAY_TOKEN_ENV).ok()
     }
 
     pub fn get_railway_api_token() -> Option<String> {
+        if account_selection()
+            .lock()
+            .expect("account selection lock poisoned")
+            .is_some()
+        {
+            return None;
+        }
         std::env::var(consts::RAILWAY_API_TOKEN_ENV).ok()
     }
 
