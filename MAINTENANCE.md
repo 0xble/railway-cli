@@ -19,48 +19,14 @@ Accepted upstream baseline: `17c8e2d` (5.52.0); publish only to `fork`.
 
 ## Active patches
 
-### MULTIACCOUNT-001
+Read both linked support files on every maintenance run. This root is the sole
+enrolled contract; support files extend its shared Preserve and Update and verify
+requirements with the complete patch records and focused proof.
 
-- Named accounts, local list/import, account-scoped saved connections, Claude
-  cache and agent preferences, MCP child argv pinning, private no-clobber import.
-- Upstream issue: https://github.com/railwayapp/cli/issues/688
-- Tests: `tests/multiaccount.rs`, `tests/multiaccount_auth.rs` (loopback HTTP),
-  `tests/account_errors.rs` (portable JSON/path/ordering contract).
-- The upstream 5.52.0 code-connection archive was reconciled using
-  `Configs::account_data_dir_in(home)` for every archive/snapshot path.
-- Do not automatically migrate ancillary state, SSH keys, or editor credentials.
-- Retire when upstream supplies equivalent isolated named profiles.
-
-### ACCOUNT-HARDENING-002
-
-- Fork identity and upstream replacement policy are compile-time Cargo metadata.
-  Both detached self-update and explicit package-manager upgrade are blocked.
-  `railway upgrade --check` exposes fork identity and source commit. Removing
-  the fork metadata restores upstream policy; no runtime bypass exists.
-- Config reads fail closed on corruption and I/O failures without overwriting
-  original bytes. Diagnostics omit deserializer values. Restore a known-good
-  private backup rather than deleting the damaged store automatically.
-- Session lock failures block refresh. Separate short write locks serialize
-  credential merge and atomic publication without recursively locking refresh.
-- Local MCP reloads its pinned config and discards the bearer-bearing client
-  after logout, file removal, or unreadable config. In-flight requests already
-  sent cannot be recalled.
-- JSON account-selection errors use ACCOUNT_REQUIRED, ACCOUNT_UNKNOWN and
-  ACCOUNT_INVALID. The parsed --json flag controls output, not child argv.
-- Existing Linux/macOS/Windows hosted matrix explicitly runs portable account
-  and store regressions. A missing/billing-blocked run is never called passing.
-- Windows MSVC/GNU binaries reserve an 8 MiB main stack for the async dispatcher;
-  the debug executable otherwise overflows before even parsing `--help`.
-  Portable subprocess tests exercise the actual debug binary without skipping.
-- Debug-only `RAILWAY_TEST_HOME` isolates subprocess credential fixtures on
-  Windows, whose known-folder API ignores HOME/USERPROFILE. It must be absolute
-  and is compiled out of release builds; release credential routing is unchanged.
-  The mutating Windows subprocess fixtures run only in debug mode; release-mode
-  tests must never fall back to a developer's real known-folder credentials.
-- Tests: config lock/contention/redaction unit tests; config_store subprocess
-  tests; actual loopback MCP no-Authorization regression; fork updater unit and
-  package-manager subprocess refusal tests.
-- Retire each behavior when upstream has equivalent tested protections.
+| Patch | Required behavior and record | When |
+| --- | --- | --- |
+| MULTIACCOUNT-001 | [Isolated named profiles and account-scoped state](maintenance/named-profiles.md) | Every run |
+| ACCOUNT-HARDENING-002 | [Credential-store, refresh, MCP, and fork-update protections](maintenance/account-hardening.md) | Every run |
 
 ## Update and verify
 
